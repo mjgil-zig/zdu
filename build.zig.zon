@@ -1,0 +1,17 @@
+.{
+    .name = .zdu,
+    .version = "0.1.0",
+    .fingerprint = 0x87d91f84d0b6b876,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#cac2f79934f8a6c4f20b391a25740907853a0c0b",
+            .hash = "vaxis-0.6.0-BWNV_CrbCQCscGpzsAlR402rYQ_tV3aAl081c2iRRkka",
+        },
+    },
+}
