@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-macos
+            asset: zdu-aarch64-macos.tar.gz
+            file_kind: Mach-O
+
+          - runner: macos-15-intel
+            target: x86_64-macos
+            asset: zdu-x86_64-macos.tar.gz
+            file_kind: Mach-O
+
+          - runner: ubuntu-24.04
+            target: x86_64-linux-gnu
+            asset: zdu-x86_64-linux.tar.gz
+            file_kind: ELF
+
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-gnu
+            asset: zdu-aarch64-linux.tar.gz
+            file_kind: ELF
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            ~/Library/Caches/zig
+            .zig-cache
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon', 'build.zig', 'src/**/*.zig', 'lib/**/*.zig') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-zig-${{ env.ZIG_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-zig-
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dcpu=baseline --summary all
+
+      - name: Verify artifact platform
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -x zig-out/bin/zdu
+          file zig-out/bin/zdu
+
+          case "${{ matrix.file_kind }}" in
+            Mach-O)
+              file zig-out/bin/zdu | grep -q 'Mach-O'
+              ;;
+            ELF)
+              file zig-out/bin/zdu | grep -q 'ELF'
+              ;;
+            *)
+              echo "unknown file_kind: ${{ matrix.file_kind }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Package asset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p package dist
+          cp zig-out/bin/zdu package/zdu
+          chmod 755 package/zdu
+
+          # Avoid macOS AppleDouble metadata in tarballs.
+          COPYFILE_DISABLE=1 tar -C package -czf "dist/${{ matrix.asset }}" zdu
+
+          cd dist
+          shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          ls -lh
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+
+          ls -lh release-assets
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$tag" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" \
+              --generate-notes
+          fi
