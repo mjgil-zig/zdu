@@ -408,3 +408,53 @@ pub fn formatResult(result: ScanResult, opts: Options, writer: anytype) !void {
         },
     }
 }
+
+test "Options defaults" {
+    const opts = Options{
+        .path = ".",
+        .format = .human,
+        .summarize = false,
+        .show_hidden = false,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+        .use_io_uring = false,
+    };
+    try std.testing.expect(!opts.parallel);
+    try std.testing.expectEqual(@as(usize, 1), opts.num_threads);
+}
+
+test "Format enum values" {
+    try std.testing.expectEqual(@as(Format, 0), .human);
+    try std.testing.expectEqual(@as(Format, 1), .json);
+}
+
+test "ScanResult init" {
+    const result = ScanResult{
+        .entries = &.{},
+        .total_size = 1024,
+        .total_files = 5,
+        .total_dirs = 2,
+        .scan_time_ms = 100,
+        .error_count = 0,
+    };
+    try std.testing.expectEqual(@as(u64, 1024), result.total_size);
+    try std.testing.expectEqual(@as(u64, 5), result.total_files);
+    try std.testing.expectEqual(@as(u64, 2), result.total_dirs);
+}
+
+test "Entry init" {
+    const entry = Entry{
+        .name = "test",
+        .path = "/test",
+        .size = 512,
+        .is_dir = false,
+        .is_file = true,
+        .is_symlink = false,
+        .depth = 0,
+    };
+    try std.testing.expect(entry.is_file);
+    try std.testing.expect(!entry.is_dir);
+    try std.testing.expectEqual(@as(u64, 512), entry.size);
+}
