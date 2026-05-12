@@ -135,15 +135,15 @@ pub fn scan(io: std.Io, opts: Options) !ScanResult {
     };
 }
 
-fn isGeneratedDirPath(path: []const u8) bool {
+pub fn isGeneratedDirPath(path: []const u8) bool {
     return mem.eql(u8, path, "/proc") or mem.startsWith(u8, path, "/proc/");
 }
 
-fn pathNeedsGeneratedDirChecks(path: []const u8) bool {
+pub fn pathNeedsGeneratedDirChecks(path: []const u8) bool {
     return mem.eql(u8, path, "/") or isGeneratedDirPath(path);
 }
 
-fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?std.c.Stat {
+pub fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?std.c.Stat {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (sub_path.len + 1 > path_buf.len) return null;
     @memcpy(path_buf[0..sub_path.len], sub_path);
@@ -155,14 +155,15 @@ fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?std.c.Stat {
     return stat;
 }
 
-fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+pub fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
     return switch (builtin.os.tag) {
-        .linux, .macos => if (builtin.link_libc) fileSizeOnDiskWithLibcAt(dir, sub_path, io) else fileSizeOnDiskFallbackAt(dir, sub_path, io),
+        .linux => if (builtin.link_libc) fileSizeOnDiskWithLibcAt(dir, sub_path, io) else fileSizeOnDiskFallbackAt(dir, sub_path, io),
+        .macos => fileSizeOnDiskFallbackAt(dir, sub_path, io),
         else => fileSizeOnDiskFallbackAt(dir, sub_path, io),
     };
 }
 
-fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+pub fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
     const stat = cStatAt(dir, sub_path) orelse return fileSizeOnDiskFallbackAt(dir, sub_path, io);
     const apparent_size: u64 = if (stat.size < 0) 0 else @intCast(stat.size);
     if (!std.c.S.ISREG(stat.mode)) return apparent_size;
@@ -170,7 +171,7 @@ fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u
     return @as(u64, @intCast(stat.blocks)) * 512;
 }
 
-fn fileSizeOnDiskFallbackAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+pub fn fileSizeOnDiskFallbackAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
     const stat = dir.statFile(io, sub_path, .{ .follow_symlinks = false }) catch return 0;
     return stat.size;
 }
