@@ -14,12 +14,14 @@ curl -fsSL https://mjgil.com/zdu/install.sh | bash
 | **zdu** | `zdu --no-tui "/home/user/git"` | **1.15** | **0.88** | **0.28** |
 
 ### Memory Usage
-| Directory Size | `zdu` Memory | Other Tools Memory |
-|---|---|---|
+| Directory Size | `zdu --no-tui` Memory | Other Tools Memory |
+|---|---:|---:|
 | 10k files | ~8 MB | ~50 MB |
 | 100k files | ~8 MB | ~450 MB |
 | 1M files | **~8 MB** | **800 MB+** |
 | 10M files | **~8.2 MB** | **2 GB+** |
+
+The TUI keeps the visible directory entries for the current directory. During the initial loading scan it fills those entries in place; it no longer keeps a separate pending-entry list or a second finalized-entry list.
 
 ## Cache behavior
 
@@ -27,7 +29,7 @@ By default:
 
 - On every fresh process start, the initial loading screen recomputes directory sizes from the filesystem.
 - That initial scan writes directory sizes back to xattrs from the bottom up.
-- After the loading screen finishes, in-process navigation does not walk directories again.
+- There is no in-process session-size cache.
 - Post-startup navigation reads directory sizes from xattrs only.
 
 With cache enabled:
@@ -39,15 +41,18 @@ With cache enabled:
 
 Delete behavior:
 
-- Deleting a file or directory updates parent directory sizes in memory for the current run.
-- The delete path also writes updated xattrs for every parent directory up to the root of the current navigation chain.
+- Deleting a file or directory writes updated xattrs for every parent directory up to the root of the current navigation chain.
+- The active view is reloaded after deletion.
 
 ## How
 
-`zdu` computes directory sizes, stores them in xattrs, and then reuses those xattrs for navigation within the same run.
+`zdu` computes directory sizes, stores them in xattrs, and then reuses those xattrs for navigation.
+
+The library API is summary-oriented: `scan()` returns totals without retaining per-entry names or paths, and `scanAndFormat()` streams entry output directly to the supplied writer.
 
 ## CLI
 
 - `zdu [path]`
 - `zdu --cache-ttl 300 [path]`
 - `zdu --cache-ttl [path]` (defaults to 60s)
+- `zdu --no-tui [path]`

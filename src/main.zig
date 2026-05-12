@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
+const zdu = @import("zdu");
 const mem = std.mem;
 
 const c_stat = struct {
@@ -49,6 +50,10 @@ const darwin_xattr = struct {
     ) c_int;
 };
 
+fn isGeneratedDirPath(path: []const u8) bool {
+    return mem.eql(u8, path, "/proc") or mem.startsWith(u8, path, "/proc/");
+}
+
 pub const Model = struct {
     io: std.Io,
     allocator: mem.Allocator,
@@ -62,8 +67,6 @@ pub const Model = struct {
     parent: ?*Model = null,
     spinner_frame: usize = 0,
     cache_ttl_seconds: u64 = 0,
-    session_cache: *SessionCache,
-    owns_session_cache: bool = false,
 
     const loading_frames = [_][]const u8{ "|", "/", "-", "\\" };
     const loading_tick_ms: u32 = 16;
@@ -77,26 +80,6 @@ pub const Model = struct {
     const DirStats = struct {
         size: u64,
         dir_count: u64,
-    };
-
-    const SessionCache = struct {
-        sizes: std.StringHashMap(u64),
-        tracked_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-        tracked_entries: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-
-        fn init(allocator: mem.Allocator) SessionCache {
-            return .{
-                .sizes = std.StringHashMap(u64).init(allocator),
-            };
-        }
-
-        fn deinit(cache: *SessionCache, allocator: mem.Allocator) void {
-            var iter = cache.sizes.iterator();
-            while (iter.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-            }
-            cache.sizes.deinit();
-        }
     };
 
     const EntryRole = enum {
@@ -119,30 +102,19 @@ pub const Model = struct {
         size: u64,
     };
 
-    const PendingEntry = struct {
-        name: []u8,
-        path: []u8,
-        is_dir: bool,
-        role: EntryRole = .item,
-    };
-
     const ScanFrame = struct {
         dir: std.Io.Dir,
         iter: std.Io.Dir.Iterator,
-        pending_index: usize,
+        entry_index: usize,
         total: u64 = 0,
     };
 
     const Loading = struct {
-        pending: []PendingEntry,
-        pending_bytes: u64,
         processed: usize = 0,
-        pending_index: usize = 0,
+        entry_index: usize = 0,
         processed_bytes: u64 = 0,
         processed_dirs: u64 = 0,
-        pending_sizes: []u64,
         scan_stack: std.ArrayList(ScanFrame) = .empty,
-        entries_list: std.ArrayList(Entry) = .empty,
         started_at: std.Io.Timestamp,
     };
 
@@ -152,16 +124,11 @@ pub const Model = struct {
 
     pub fn initWithCache(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !*Model {
         const model = try allocator.create(Model);
-        const session_cache = try allocator.create(SessionCache);
-        session_cache.* = SessionCache.init(allocator);
-        errdefer allocator.destroy(session_cache);
         model.* = .{
             .io = io,
             .allocator = allocator,
             .cwd = try allocator.dupe(u8, cwd),
             .cache_ttl_seconds = cache_ttl_seconds,
-            .session_cache = session_cache,
-            .owns_session_cache = true,
         };
         try model.primeDirXattrs();
         try model.loadDir();
@@ -174,16 +141,11 @@ pub const Model = struct {
 
     pub fn initLoadingWithCache(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !*Model {
         const model = try allocator.create(Model);
-        const session_cache = try allocator.create(SessionCache);
-        session_cache.* = SessionCache.init(allocator);
-        errdefer allocator.destroy(session_cache);
         model.* = .{
             .io = io,
             .allocator = allocator,
             .cwd = try allocator.dupe(u8, cwd),
             .cache_ttl_seconds = cache_ttl_seconds,
-            .session_cache = session_cache,
-            .owns_session_cache = true,
         };
         try model.beginLoading();
         return model;
@@ -194,20 +156,20 @@ pub const Model = struct {
             parent.deinit();
         }
         model.freeState();
-        if (model.owns_session_cache) {
-            model.session_cache.deinit(model.allocator);
-            model.allocator.destroy(model.session_cache);
-        }
         model.allocator.destroy(model);
+    }
+
+    fn freeEntryItems(allocator: mem.Allocator, entries: []Entry) void {
+        for (entries) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.path);
+        }
     }
 
     fn freeState(model: *Model) void {
         model.freeLoading();
         model.allocator.free(model.cwd);
-        for (model.entries) |entry| {
-            model.allocator.free(entry.name);
-            model.allocator.free(entry.path);
-        }
+        freeEntryItems(model.allocator, model.entries);
         model.allocator.free(model.entries);
         if (model.confirm_delete) |confirm| {
             model.allocator.free(confirm.path);
@@ -220,26 +182,12 @@ pub const Model = struct {
                 frame.dir.close(model.io);
             }
             loading.scan_stack.deinit(model.allocator);
-            for (loading.entries_list.items) |entry| {
-                model.allocator.free(entry.name);
-                model.allocator.free(entry.path);
-            }
-            loading.entries_list.deinit(model.allocator);
-            for (loading.pending[loading.processed..]) |pending| {
-                model.allocator.free(pending.name);
-                model.allocator.free(pending.path);
-            }
-            model.allocator.free(loading.pending_sizes);
-            model.allocator.free(loading.pending);
             model.loading = null;
         }
     }
 
     fn freeEntries(model: *Model) void {
-        for (model.entries) |entry| {
-            model.allocator.free(entry.name);
-            model.allocator.free(entry.path);
-        }
+        freeEntryItems(model.allocator, model.entries);
         model.allocator.free(model.entries);
         model.entries = &.{};
         model.selected = 0;
@@ -247,7 +195,17 @@ pub const Model = struct {
         model.last_visible_rows = 0;
     }
 
+    fn entriesStorageBytes(entries: []Entry) u64 {
+        var bytes: u64 = @as(u64, @intCast(entries.len * @sizeOf(Entry)));
+        for (entries) |entry| {
+            bytes += entry.name.len + entry.path.len;
+        }
+        return bytes;
+    }
+
     fn primeDirXattrs(model: *Model) !void {
+        if (isGeneratedDirPath(model.cwd)) return;
+
         var dir = std.Io.Dir.cwd().openDir(model.io, model.cwd, .{ .iterate = true }) catch return;
         defer dir.close(model.io);
 
@@ -257,9 +215,9 @@ pub const Model = struct {
 
             const full_path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name });
             defer model.allocator.free(full_path);
+            if (isGeneratedDirPath(full_path)) continue;
 
-            const stats = computeDirStats(full_path, model.allocator, model.io, model.cache_ttl_seconds, model.session_cache);
-            rememberSessionCachedDirSize(full_path, stats.size, model.allocator, model.session_cache);
+            _ = computeDirStats(full_path, model.allocator, model.io, model.cache_ttl_seconds);
         }
     }
 
@@ -267,11 +225,14 @@ pub const Model = struct {
         model.freeLoading();
         model.freeEntries();
 
+        if (isGeneratedDirPath(model.cwd)) return;
+
         var dir = std.Io.Dir.cwd().openDir(model.io, model.cwd, .{ .iterate = true }) catch return;
         defer dir.close(model.io);
 
         var entries_list: std.ArrayList(Entry) = .empty;
         defer entries_list.deinit(model.allocator);
+        errdefer freeEntryItems(model.allocator, entries_list.items);
 
         if (model.parent) |parent| {
             try entries_list.append(model.allocator, .{
@@ -287,6 +248,10 @@ pub const Model = struct {
         while (iter.next(model.io) catch null) |entry| {
             const full_path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name });
             errdefer model.allocator.free(full_path);
+            if (entry.kind == .directory and isGeneratedDirPath(full_path)) {
+                model.allocator.free(full_path);
+                continue;
+            }
 
             const size: u64 = if (entry.kind == .directory)
                 readCachedDirSize(full_path, model.allocator) orelse 0
@@ -319,7 +284,6 @@ pub const Model = struct {
         for (entries_list.items) |entry| {
             if (entry.role == .item) current_total_size += entry.size;
         }
-        rememberSessionCachedDirSize(model.cwd, current_total_size, model.allocator, model.session_cache);
         writeCachedDirSize(model.cwd, current_total_size, model.cache_ttl_seconds, model.allocator);
         model.entries = try entries_list.toOwnedSlice(model.allocator);
         model.selected = initialSelectedIndex(model.entries);
@@ -331,16 +295,20 @@ pub const Model = struct {
         model.freeLoading();
         model.freeEntries();
 
+        if (isGeneratedDirPath(model.cwd)) return;
+
         var dir = std.Io.Dir.cwd().openDir(model.io, model.cwd, .{ .iterate = true }) catch return;
         defer dir.close(model.io);
 
-        var pending_list: std.ArrayList(PendingEntry) = .empty;
-        defer pending_list.deinit(model.allocator);
+        var entries_list: std.ArrayList(Entry) = .empty;
+        defer entries_list.deinit(model.allocator);
+        errdefer freeEntryItems(model.allocator, entries_list.items);
 
         if (model.parent) |parent| {
-            try pending_list.append(model.allocator, .{
+            try entries_list.append(model.allocator, .{
                 .name = try model.allocator.dupe(u8, ".."),
                 .path = try model.allocator.dupe(u8, parent.cwd),
+                .size = readCachedDirSize(parent.cwd, model.allocator) orelse 0,
                 .is_dir = true,
                 .role = .parent,
             });
@@ -348,30 +316,30 @@ pub const Model = struct {
 
         var iter = dir.iterate();
         while (iter.next(model.io) catch null) |entry| {
-            try pending_list.append(model.allocator, .{
+            const full_path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name });
+            errdefer model.allocator.free(full_path);
+            if (entry.kind == .directory and isGeneratedDirPath(full_path)) {
+                model.allocator.free(full_path);
+                continue;
+            }
+
+            try entries_list.append(model.allocator, .{
                 .name = try model.allocator.dupe(u8, entry.name),
-                .path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name }),
+                .path = full_path,
+                .size = 0,
                 .is_dir = entry.kind == .directory,
                 .role = .item,
             });
         }
 
-        const pending = try pending_list.toOwnedSlice(model.allocator);
-        var pending_bytes: u64 = @as(u64, @intCast(pending.len * @sizeOf(PendingEntry)));
-        for (pending) |entry| {
-            pending_bytes += entry.name.len + entry.path.len;
-        }
-        const pending_sizes = try model.allocator.alloc(u64, pending.len);
-        errdefer model.allocator.free(pending_sizes);
-        @memset(pending_sizes, 0);
-
+        model.entries = try entries_list.toOwnedSlice(model.allocator);
         model.loading = .{
-            .pending = pending,
-            .pending_bytes = pending_bytes,
-            .pending_sizes = pending_sizes,
             .started_at = .now(model.io, .awake),
         };
         model.spinner_frame = 0;
+        model.selected = initialSelectedIndex(model.entries);
+        model.scroll_offset = 0;
+        model.last_visible_rows = 0;
     }
 
     fn advanceLoading(model: *Model) !void {
@@ -384,9 +352,9 @@ pub const Model = struct {
         }
 
         loading = &model.loading.?;
-        if (loading.processed < loading.pending.len) return;
+        if (loading.processed < model.entries.len) return;
 
-        mem.sortUnstable(Entry, loading.entries_list.items, {}, struct {
+        mem.sortUnstable(Entry, model.entries, {}, struct {
             fn less(_: void, a: Entry, b: Entry) bool {
                 if (entryRoleRank(a.role) != entryRoleRank(b.role)) return entryRoleRank(a.role) < entryRoleRank(b.role);
                 if (a.size != b.size) return a.size > b.size;
@@ -395,13 +363,10 @@ pub const Model = struct {
         }.less);
 
         if (model.parent == null) {
-            try prependRootSummary(model.allocator, &loading.entries_list, model.cwd);
+            try model.prependRootSummaryToEntries();
         }
 
-        model.entries = try loading.entries_list.toOwnedSlice(model.allocator);
         loading.scan_stack.deinit(model.allocator);
-        model.allocator.free(loading.pending_sizes);
-        model.allocator.free(loading.pending);
         model.loading = null;
         model.selected = initialSelectedIndex(model.entries);
         model.scroll_offset = 0;
@@ -436,7 +401,7 @@ pub const Model = struct {
                     try loading.scan_stack.append(model.allocator, .{
                         .dir = dir,
                         .iter = dir.iterateAssumeFirstIteration(),
-                        .pending_index = frame.pending_index,
+                        .entry_index = frame.entry_index,
                         .total = 0,
                     });
                     return true;
@@ -452,72 +417,81 @@ pub const Model = struct {
             if (loading.scan_stack.items.len > 0) {
                 loading.scan_stack.items[loading.scan_stack.items.len - 1].total += completed.total;
             } else {
-                try model.finalizePendingEntry(completed.pending_index, completed.total);
+                try model.finalizeLoadingEntry(completed.entry_index, completed.total);
             }
             return true;
         }
 
-        if (loading.pending_index >= loading.pending.len) return false;
+        if (loading.entry_index >= model.entries.len) return false;
 
-        const idx = loading.pending_index;
-        const pending = loading.pending[idx];
-        if (!pending.is_dir) {
-            const size = fileSizeOnDisk(pending.path, model.allocator, model.io);
-            loading.pending_sizes[idx] = size;
+        const idx = loading.entry_index;
+        const entry = &model.entries[idx];
+        if (entry.role != .item) {
+            loading.processed += 1;
+            loading.entry_index += 1;
+            return true;
+        }
+
+        if (!entry.is_dir) {
+            const size = fileSizeOnDisk(entry.path, model.allocator, model.io);
             loading.processed_bytes += size;
-            try model.finalizePendingEntry(idx, size);
+            try model.finalizeLoadingEntry(idx, size);
             return true;
         }
 
-        if (readSessionCachedDirSize(pending.path, model.session_cache)) |cached_size| {
-            loading.pending_sizes[idx] = cached_size;
-            loading.processed_bytes += cached_size;
-            loading.processed_dirs += 1;
-            try model.finalizePendingEntry(idx, cached_size);
-            return true;
-        }
         if (model.cache_ttl_seconds > 0) {
-            if (readCachedDirSize(pending.path, model.allocator)) |cached_size| {
-                loading.pending_sizes[idx] = cached_size;
+            if (readCachedDirSize(entry.path, model.allocator)) |cached_size| {
                 loading.processed_bytes += cached_size;
                 loading.processed_dirs += 1;
-                try model.finalizePendingEntry(idx, cached_size);
+                try model.finalizeLoadingEntry(idx, cached_size);
                 return true;
             }
         }
 
-        var dir = std.Io.Dir.cwd().openDir(model.io, pending.path, .{ .iterate = true }) catch {
-            try model.finalizePendingEntry(idx, 0);
+        var dir = std.Io.Dir.cwd().openDir(model.io, entry.path, .{ .iterate = true }) catch {
+            try model.finalizeLoadingEntry(idx, 0);
             return true;
         };
         loading.processed_dirs += 1;
         try loading.scan_stack.append(model.allocator, .{
             .dir = dir,
             .iter = dir.iterateAssumeFirstIteration(),
-            .pending_index = idx,
+            .entry_index = idx,
             .total = 0,
         });
         return true;
     }
 
-    fn finalizePendingEntry(model: *Model, pending_index: usize, size: u64) !void {
+    fn finalizeLoadingEntry(model: *Model, entry_index: usize, size: u64) !void {
         const loading = &model.loading.?;
-        const pending = loading.pending[pending_index];
+        if (entry_index < model.entries.len) {
+            model.entries[entry_index].size = size;
+            if (model.entries[entry_index].is_dir and model.entries[entry_index].role == .item) {
+                writeCachedDirSize(model.entries[entry_index].path, size, model.cache_ttl_seconds, model.allocator);
+            }
+        }
+        loading.processed += 1;
+        loading.entry_index += 1;
+    }
 
-        if (pending.is_dir) {
-            rememberSessionCachedDirSize(pending.path, size, model.allocator, model.session_cache);
-            writeCachedDirSize(pending.path, size, model.cache_ttl_seconds, model.allocator);
+    fn prependRootSummaryToEntries(model: *Model) !void {
+        var total_size: u64 = 0;
+        for (model.entries) |entry| {
+            if (entry.role == .item) total_size += entry.size;
         }
 
-        try loading.entries_list.append(model.allocator, .{
-            .name = pending.name,
-            .path = pending.path,
-            .size = size,
-            .is_dir = pending.is_dir,
-            .role = pending.role,
-        });
-        loading.processed += 1;
-        loading.pending_index += 1;
+        const updated = try model.allocator.alloc(Entry, model.entries.len + 1);
+        updated[0] = .{
+            .name = try model.allocator.dupe(u8, ""),
+            .path = try model.allocator.dupe(u8, model.cwd),
+            .size = total_size,
+            .is_dir = true,
+            .role = .summary,
+        };
+        @memcpy(updated[1..], model.entries);
+        model.allocator.free(model.entries);
+        model.entries = updated;
+        writeCachedDirSize(model.cwd, total_size, model.cache_ttl_seconds, model.allocator);
     }
 
     fn entryRoleRank(role: EntryRole) u8 {
@@ -574,8 +548,8 @@ pub const Model = struct {
         }
     }
 
-    fn computeDirSize(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64, session_cache: *SessionCache) u64 {
-        return computeDirStats(path, allocator, io, cache_ttl_seconds, session_cache).size;
+    fn computeDirSize(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) u64 {
+        return computeDirStats(path, allocator, io, cache_ttl_seconds).size;
     }
 
     const StackFrame = struct {
@@ -584,10 +558,8 @@ pub const Model = struct {
         total: u64 = 0,
     };
 
-    fn computeDirStats(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64, session_cache: *SessionCache) DirStats {
-        if (readSessionCachedDirSize(path, session_cache)) |cached_size| {
-            return .{ .size = cached_size, .dir_count = 1 };
-        }
+    fn computeDirStats(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) DirStats {
+        if (isGeneratedDirPath(path)) return .{ .size = 0, .dir_count = 0 };
 
         if (cache_ttl_seconds > 0) {
             if (readCachedDirSize(path, allocator)) |cached_size| {
@@ -598,10 +570,10 @@ pub const Model = struct {
         var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return .{ .size = 0, .dir_count = 1 };
         defer dir.close(io);
 
-        return computeDirStatsInDir(dir, allocator, io, cache_ttl_seconds, session_cache);
+        return computeDirStatsInDir(dir, io, cache_ttl_seconds);
     }
 
-    fn computeDirStatsInDir(dir: std.Io.Dir, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64, session_cache: *SessionCache) DirStats {
+    fn computeDirStatsInDir(dir: std.Io.Dir, io: std.Io, cache_ttl_seconds: u64) DirStats {
         if (cache_ttl_seconds > 0) {
             if (readCachedDirSizeFd(dir)) |cached_size| {
                 return .{ .size = cached_size, .dir_count = 1 };
@@ -617,7 +589,7 @@ pub const Model = struct {
             } else if (entry.kind == .directory) {
                 var subdir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                 defer subdir.close(io);
-                const child = computeDirStatsInDir(subdir, allocator, io, cache_ttl_seconds, session_cache);
+                const child = computeDirStatsInDir(subdir, io, cache_ttl_seconds);
                 total += child.size;
                 dir_count += child.dir_count;
             }
@@ -626,9 +598,7 @@ pub const Model = struct {
         return .{ .size = total, .dir_count = dir_count };
     }
 
-    fn computeDirStatsStack(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64, session_cache: *SessionCache) !DirStats {
-        _ = session_cache;
-
+    fn computeDirStatsStack(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) !DirStats {
         var stack: std.ArrayList(StackFrame) = .empty;
         defer {
             for (stack.items) |*frame| {
@@ -722,25 +692,6 @@ pub const Model = struct {
         if (stat.blocks < 0) return null;
         const blocks = @as(u64, @intCast(stat.blocks));
         return blocks * 512;
-    }
-
-    fn readSessionCachedDirSize(path: []const u8, session_cache: *SessionCache) ?u64 {
-        _ = path;
-        _ = session_cache;
-        return null;
-    }
-
-    fn rememberSessionCachedDirSize(path: []const u8, size: u64, allocator: mem.Allocator, session_cache: *SessionCache) void {
-        _ = path;
-        _ = size;
-        _ = allocator;
-        _ = session_cache;
-    }
-
-    fn clearSessionCachedDirSize(path: []const u8, allocator: mem.Allocator, session_cache: *SessionCache) void {
-        _ = path;
-        _ = allocator;
-        _ = session_cache;
     }
 
     fn readCachedDirSize(path: []const u8, allocator: mem.Allocator) ?u64 {
@@ -922,7 +873,6 @@ pub const Model = struct {
     fn clearDirSizeCacheChain(model: *Model) void {
         var current: ?*Model = model;
         while (current) |cursor| {
-            clearSessionCachedDirSize(cursor.cwd, cursor.allocator, cursor.session_cache);
             clearCachedDirSize(cursor.cwd, cursor.allocator);
             current = cursor.parent;
         }
@@ -931,8 +881,7 @@ pub const Model = struct {
     fn propagateDeletedSize(model: *Model, deleted_size: u64) void {
         var current: ?*Model = model;
         while (current) |cursor| {
-            const current_size = readCachedDirSize(cursor.cwd, cursor.allocator) orelse
-                readSessionCachedDirSize(cursor.cwd, cursor.session_cache) orelse blk: {
+            const current_size = readCachedDirSize(cursor.cwd, cursor.allocator) orelse blk: {
                 if (cursor.entries.len > 0) {
                     if (cursor.entries[0].role == .summary) break :blk cursor.entries[0].size;
                     var total: u64 = 0;
@@ -946,11 +895,12 @@ pub const Model = struct {
                     cursor.allocator,
                     cursor.io,
                     cursor.cache_ttl_seconds,
-                    cursor.session_cache,
                 );
             };
             const updated_size = current_size -| deleted_size;
-            rememberSessionCachedDirSize(cursor.cwd, updated_size, cursor.allocator, cursor.session_cache);
+            if (cursor.entries.len > 0 and cursor.entries[0].role == .summary) {
+                cursor.entries[0].size = updated_size;
+            }
             writeCachedDirSize(cursor.cwd, updated_size, cursor.cache_ttl_seconds, cursor.allocator);
             current = cursor.parent;
         }
@@ -996,19 +946,20 @@ pub const Model = struct {
         const next_cwd = try model.allocator.dupe(u8, entry.path);
         errdefer model.allocator.free(next_cwd);
 
-        const parent = try model.allocator.create(Model);
-        errdefer model.allocator.destroy(parent);
+        const io = model.io;
+        const allocator = model.allocator;
+        const cache_ttl_seconds = model.cache_ttl_seconds;
+
+        const parent = try allocator.create(Model);
+        errdefer allocator.destroy(parent);
         parent.* = model.*;
-        parent.owns_session_cache = false;
 
         model.* = .{
-            .io = model.io,
-            .allocator = model.allocator,
+            .io = io,
+            .allocator = allocator,
             .cwd = next_cwd,
             .parent = parent,
-            .cache_ttl_seconds = model.cache_ttl_seconds,
-            .session_cache = parent.session_cache,
-            .owns_session_cache = true,
+            .cache_ttl_seconds = cache_ttl_seconds,
         };
         model.loadDir() catch {
             model.allocator.free(model.cwd);
@@ -1021,7 +972,6 @@ pub const Model = struct {
         if (model.parent) |parent| {
             model.freeState();
             model.* = parent.*;
-            model.owns_session_cache = true;
             model.allocator.destroy(parent);
         }
     }
@@ -1264,14 +1214,13 @@ pub const Model = struct {
 
     fn drawLoading(model: *Model, surface: *vxfw.Surface, allocator: mem.Allocator, width: u16, height: u16) mem.Allocator.Error!void {
         var loading = &model.loading.?;
-        const total = loading.pending.len;
+        const total = model.entries.len;
         const done = loading.processed;
         const processed_bytes = loading.processed_bytes;
         const processed_dirs = loading.processed_dirs;
-        const entries_capacity_bytes = @as(u64, @intCast(loading.entries_list.capacity * @sizeOf(Entry)));
-        const cache_bytes = model.session_cache.tracked_bytes.load(.acquire);
-        const cache_entries = model.session_cache.tracked_entries.load(.acquire);
-        const retained_bytes = loading.pending_bytes + entries_capacity_bytes + cache_bytes;
+        const entries_bytes = entriesStorageBytes(model.entries);
+        const stack_bytes = @as(u64, @intCast(loading.scan_stack.capacity * @sizeOf(ScanFrame)));
+        const retained_bytes = entries_bytes + stack_bytes;
 
         const elapsed_ns = @max(@as(i128, 0), loading.started_at.durationTo(std.Io.Timestamp.now(model.io, .awake)).nanoseconds);
         var elapsed_buf: [32]u8 = undefined;
@@ -1281,19 +1230,17 @@ pub const Model = struct {
         const dir_label = if (processed_dirs == 1) "directory" else "directories";
         var retained_buf: [32]u8 = undefined;
         const retained_text = formatSize(&retained_buf, retained_bytes);
-        var pending_buf: [32]u8 = undefined;
-        const pending_text = formatSize(&pending_buf, loading.pending_bytes);
         var entries_buf: [32]u8 = undefined;
-        const entries_text = formatSize(&entries_buf, entries_capacity_bytes);
-        var cache_buf: [32]u8 = undefined;
-        const cache_text = formatSize(&cache_buf, cache_bytes);
+        const entries_text = formatSize(&entries_buf, entries_bytes);
+        var stack_buf: [32]u8 = undefined;
+        const stack_text = formatSize(&stack_buf, stack_bytes);
 
         const title = "Loading directory";
         const spinner = loading_frames[model.spinner_frame];
         const status = try std.fmt.allocPrint(allocator, "{s} {d}/{d} entries", .{ spinner, done, total });
         const detail = try std.fmt.allocPrint(allocator, "Processed: {s}", .{processed_text});
         const meta = try std.fmt.allocPrint(allocator, "{d} {s}   Elapsed: {s}", .{ processed_dirs, dir_label, elapsed_text });
-        const retained = try std.fmt.allocPrint(allocator, "Retained~ {s}  pending {s}  entries {s}  cache {s}/{d}", .{ retained_text, pending_text, entries_text, cache_text, cache_entries });
+        const retained = try std.fmt.allocPrint(allocator, "Retained~ {s}  entries {s}  stack {s}", .{ retained_text, entries_text, stack_text });
 
         const start_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(title.len)))) / 2));
         const status_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(status.len)))) / 2));
@@ -1408,6 +1355,7 @@ test "navigateInto adds parent entry and navigateUp restores cwd" {
     try std.testing.expectEqual(Model.EntryRole.summary, model.entries[0].role);
     try std.testing.expectEqualStrings("", model.entries[0].name);
     try std.testing.expectEqual(@as(usize, 1), model.selected);
+    const root_size = model.entries[0].size;
 
     model.selected = dir_idx;
     try model.navigateInto();
@@ -1416,7 +1364,7 @@ test "navigateInto adds parent entry and navigateUp restores cwd" {
     try std.testing.expect(model.parent != null);
     try std.testing.expectEqual(Model.EntryRole.parent, model.entries[0].role);
     try std.testing.expectEqualStrings("..", model.entries[0].name);
-    try std.testing.expectEqual(Model.computeDirSize(root_cwd, arena.allocator(), io, 0, model.session_cache), model.entries[0].size);
+    try std.testing.expectEqual(root_size, model.entries[0].size);
     try std.testing.expect(findEntryIndex(model, "..") == 0);
     try std.testing.expectEqual(@as(usize, 1), model.selected);
 
@@ -1496,13 +1444,10 @@ test "selection scrolling follows the viewport" {
         .{ .name = "", .path = "", .size = 0, .is_dir = false },
         .{ .name = "", .path = "", .size = 0, .is_dir = false },
     };
-    var session_cache = Model.SessionCache.init(std.testing.allocator);
-    defer session_cache.deinit(std.testing.allocator);
     var model: Model = .{
         .io = std.testing.io,
         .allocator = std.testing.allocator,
         .cwd = "",
-        .session_cache = &session_cache,
     };
     model.entries = entries[0..];
 
@@ -1534,9 +1479,6 @@ test "directory size xattr round trip" {
 }
 
 test "mouse clicks outside the visible list are ignored" {
-    var session_cache = Model.SessionCache.init(std.testing.allocator);
-    defer session_cache.deinit(std.testing.allocator);
-
     var entries = [_]Model.Entry{
         .{ .name = @constCast("file"), .path = @constCast("/tmp/file"), .size = 1, .is_dir = false },
     };
@@ -1546,7 +1488,6 @@ test "mouse clicks outside the visible list are ignored" {
         .cwd = "",
         .entries = entries[0..],
         .last_visible_rows = 1,
-        .session_cache = &session_cache,
     };
 
     var ctx = testEventContext(std.testing.allocator, std.testing.io);
@@ -1572,9 +1513,6 @@ test "mouse clicks outside the visible list are ignored" {
 }
 
 test "root summary row is not clickable" {
-    var session_cache = Model.SessionCache.init(std.testing.allocator);
-    defer session_cache.deinit(std.testing.allocator);
-
     var entries = [_]Model.Entry{
         .{ .name = @constCast(""), .path = @constCast("/tmp"), .size = 10, .is_dir = true, .role = .summary },
         .{ .name = @constCast("child"), .path = @constCast("/tmp/child"), .size = 1, .is_dir = true },
@@ -1586,7 +1524,6 @@ test "root summary row is not clickable" {
         .entries = entries[0..],
         .selected = 1,
         .last_visible_rows = 2,
-        .session_cache = &session_cache,
     };
 
     var ctx = testEventContext(std.testing.allocator, std.testing.io);
@@ -1605,9 +1542,6 @@ test "root summary row is not clickable" {
 }
 
 test "mouse motion uses pointer only for selectable rows" {
-    var session_cache = Model.SessionCache.init(std.testing.allocator);
-    defer session_cache.deinit(std.testing.allocator);
-
     var entries = [_]Model.Entry{
         .{ .name = @constCast(""), .path = @constCast("/tmp"), .size = 10, .is_dir = true, .role = .summary },
         .{ .name = @constCast("child"), .path = @constCast("/tmp/child"), .size = 1, .is_dir = true },
@@ -1618,7 +1552,6 @@ test "mouse motion uses pointer only for selectable rows" {
         .cwd = "",
         .entries = entries[0..],
         .last_visible_rows = 2,
-        .session_cache = &session_cache,
     };
 
     var ctx = testEventContext(std.testing.allocator, std.testing.io);
@@ -1644,9 +1577,6 @@ test "mouse motion uses pointer only for selectable rows" {
 }
 
 test "down key skips root summary row" {
-    var session_cache = Model.SessionCache.init(std.testing.allocator);
-    defer session_cache.deinit(std.testing.allocator);
-
     var entries = [_]Model.Entry{
         .{ .name = @constCast(""), .path = @constCast("/tmp"), .size = 10, .is_dir = true, .role = .summary },
         .{ .name = @constCast("child"), .path = @constCast("/tmp/child"), .size = 1, .is_dir = true },
@@ -1657,7 +1587,6 @@ test "down key skips root summary row" {
         .cwd = "",
         .entries = entries[0..],
         .selected = 0,
-        .session_cache = &session_cache,
     };
 
     var ctx = testEventContext(std.testing.allocator, std.testing.io);
@@ -1669,14 +1598,10 @@ test "down key skips root summary row" {
 }
 
 test "down key on an empty list does not underflow" {
-    var session_cache = Model.SessionCache.init(std.testing.allocator);
-    defer session_cache.deinit(std.testing.allocator);
-
     var model: Model = .{
         .io = std.testing.io,
         .allocator = std.testing.allocator,
         .cwd = "",
-        .session_cache = &session_cache,
     };
 
     var ctx = testEventContext(std.testing.allocator, std.testing.io);
@@ -1751,10 +1676,7 @@ test "computeDirSize counts allocated bytes for sparse files" {
     const sparse_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "sparse.bin" });
     defer std.testing.allocator.free(sparse_path);
 
-    var session_cache = Model.SessionCache.init(std.testing.allocator);
-    defer session_cache.deinit(std.testing.allocator);
-
-    const size = Model.computeDirSize(root_path, std.testing.allocator, std.testing.io, 0, &session_cache);
+    const size = Model.computeDirSize(root_path, std.testing.allocator, std.testing.io, 0);
     const stat = try std.Io.Dir.cwd().statFile(std.testing.io, sparse_path, .{});
 
     try std.testing.expectEqual(@as(u64, 1024 * 1024 * 1024), stat.size);
@@ -1769,9 +1691,6 @@ fn parseBoolArg(value: []const u8) ?bool {
 }
 
 fn benchmarkWorkerLoad(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !u64 {
-    var session_cache = Model.SessionCache.init(allocator);
-    defer session_cache.deinit(allocator);
-
     const start = std.Io.Timestamp.now(io, .awake);
     var dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
@@ -1783,13 +1702,12 @@ fn benchmarkWorkerLoad(io: std.Io, allocator: mem.Allocator, cwd: []const u8, ca
         defer allocator.free(full_path);
 
         if (entry.kind == .directory) {
-            const stats = Model.computeDirStats(full_path, allocator, io, cache_ttl_seconds, &session_cache);
+            const stats = Model.computeDirStats(full_path, allocator, io, cache_ttl_seconds);
             total_size += stats.size;
         } else if (entry.kind == .file) {
             total_size += Model.fileSizeOnDiskAt(dir, entry.name, io);
         }
     }
-    Model.rememberSessionCachedDirSize(cwd, total_size, allocator, &session_cache);
     Model.writeCachedDirSize(cwd, total_size, cache_ttl_seconds, allocator);
 
     const end = std.Io.Timestamp.now(io, .awake);
@@ -1805,8 +1723,7 @@ fn benchmarkStackLoad(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cac
 }
 
 fn scanRootTotalStack(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !u64 {
-    var session_cache = Model.SessionCache.init(allocator);
-    defer session_cache.deinit(allocator);
+    if (isGeneratedDirPath(cwd)) return 0;
 
     var dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
@@ -1818,13 +1735,13 @@ fn scanRootTotalStack(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cac
         defer allocator.free(full_path);
 
         if (entry.kind == .directory) {
-            const stats = try Model.computeDirStatsStack(full_path, allocator, io, cache_ttl_seconds, &session_cache);
+            if (isGeneratedDirPath(full_path)) continue;
+            const stats = try Model.computeDirStatsStack(full_path, allocator, io, cache_ttl_seconds);
             total_size += stats.size;
         } else if (entry.kind == .file) {
             total_size += Model.fileSizeOnDiskAt(dir, entry.name, io);
         }
     }
-    Model.rememberSessionCachedDirSize(cwd, total_size, allocator, &session_cache);
     Model.writeCachedDirSize(cwd, total_size, cache_ttl_seconds, allocator);
     return total_size;
 }
@@ -1836,12 +1753,24 @@ fn runBenchmarks(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_tt
 }
 
 fn runNoTui(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !void {
-    const total_size = try scanRootTotalStack(io, allocator, cwd, cache_ttl_seconds);
+    _ = allocator;
+    _ = cache_ttl_seconds;
+    const result = try zdu.scan(io, .{
+        .path = cwd,
+        .format = .human,
+        .summarize = true,
+        .show_hidden = false,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+        .use_io_uring = false,
+    });
 
     var stdout_buffer: [64]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    try stdout.print("{d}\n", .{total_size});
+    try stdout.print("{d}\n", .{result.total_size});
     try stdout.flush();
 }
 
@@ -2131,15 +2060,11 @@ test "expired dir size cache is recomputed and refreshed" {
 
     try zduTestSetRawDirSizeXattr(dir_path, expired_record[0..], allocator);
 
-    var session_cache = Model.SessionCache.init(allocator);
-    defer session_cache.deinit(allocator);
-
     const stats = Model.computeDirStats(
         dir_path,
         allocator,
         std.testing.io,
         60,
-        &session_cache,
     );
 
     try std.testing.expect(stats.size > 0);
@@ -2147,4 +2072,12 @@ test "expired dir size cache is recomputed and refreshed" {
 
     const refreshed = try zduTestRequireCachedSize(dir_path, allocator);
     try std.testing.expectEqual(stats.size, refreshed);
+}
+
+test "model does not process /proc" {
+    var model = try Model.init(std.testing.io, std.testing.allocator, "/proc");
+    defer model.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), model.entries.len);
+    try std.testing.expect(model.loading == null);
 }

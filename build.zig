@@ -20,15 +20,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_module.addImport("zdu", lib_module);
     test_module.addImport("vaxis", vaxis.module("vaxis"));
 
-    const tests = b.addTest(.{
+    const app_tests = b.addTest(.{
         .root_module = test_module,
     });
+    const run_app_tests = b.addRunArtifact(app_tests);
 
-    const run_tests = b.addRunArtifact(tests);
+    const lib_tests = b.addTest(.{
+        .root_module = lib_module,
+    });
+    const run_lib_tests = b.addRunArtifact(lib_tests);
+
     const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_app_tests.step);
+    test_step.dependOn(&run_lib_tests.step);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

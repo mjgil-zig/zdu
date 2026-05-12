@@ -25,18 +25,7 @@ pub const Options = struct {
     use_io_uring: bool,
 };
 
-pub const Entry = struct {
-    name: []const u8,
-    path: []const u8,
-    size: u64,
-    is_dir: bool,
-    is_file: bool,
-    is_symlink: bool,
-    depth: usize,
-};
-
 pub const ScanResult = struct {
-    entries: []Entry,
     total_size: u64,
     total_files: u64,
     total_dirs: u64,
@@ -44,23 +33,31 @@ pub const ScanResult = struct {
     error_count: u64,
 };
 
+const ScanTotals = struct {
+    total_size: u64 = 0,
+    total_files: u64 = 0,
+    total_dirs: u64 = 0,
+    error_count: u64 = 0,
+    entry_count: usize = 0,
+};
+
 pub fn scanAndFormat(io: std.Io, opts: Options, writer: anytype) !void {
-    if (opts.summarize) {
-        const result = try scan(io, opts);
-        try formatResult(result, opts, writer);
+    if (isGeneratedDirPath(opts.path)) {
+        switch (opts.format) {
+            .human => try writer.writeAll("Entries:\n\nSummary:\n  Total size: 0\n  Files: 0\n  Directories: 0\n  Scan time: 0ms\n  Errors: 0\n"),
+            .json => try writer.writeAll("{\n  \"entries\": [\n  ],\n  \"total_size\": 0,\n  \"total_files\": 0,\n  \"total_dirs\": 0,\n  \"scan_time_ms\": 0,\n  \"error_count\": 0\n}\n"),
+        }
         return;
     }
 
     const allocator = std.heap.page_allocator;
-    var total_size: u64 = 0;
-    var total_files: u64 = 0;
-    var total_dirs: u64 = 0;
-    var error_count: u64 = 0;
-    var entry_count: usize = 0;
+    var totals: ScanTotals = .{};
     var first_json_entry = true;
 
     switch (opts.format) {
-        .human => try writer.writeAll("Entries:\n"),
+        .human => {
+            if (!opts.summarize) try writer.writeAll("Entries:\n");
+        },
         .json => try writer.writeAll("{\n  \"entries\": [\n"),
     }
 
@@ -77,76 +74,93 @@ pub fn scanAndFormat(io: std.Io, opts: Options, writer: anytype) !void {
         dir,
         &iter,
         0,
-        &entry_count,
         &first_json_entry,
-        &total_size,
-        &total_files,
-        &total_dirs,
-        &error_count,
+        &totals,
     );
 
     switch (opts.format) {
         .human => {
-            try writer.writeAll("\nSummary:\n");
-            try writer.print("  Total size: {}\n", .{total_size});
-            try writer.print("  Files: {}\n", .{total_files});
-            try writer.print("  Directories: {}\n", .{total_dirs});
-            try writer.print("  Scan time: 0ms\n", .{});
-            try writer.print("  Errors: {}\n", .{error_count});
+            if (!opts.summarize) try writer.writeAll("\n");
+            try writeHumanSummary(writer, .{
+                .total_size = totals.total_size,
+                .total_files = totals.total_files,
+                .total_dirs = totals.total_dirs,
+                .scan_time_ms = 0,
+                .error_count = totals.error_count,
+            });
         },
         .json => {
             try writer.writeAll("  ],\n");
-            try writer.print("  \"total_size\": {},\n", .{total_size});
-            try writer.print("  \"total_files\": {},\n", .{total_files});
-            try writer.print("  \"total_dirs\": {},\n", .{total_dirs});
-            try writer.print("  \"scan_time_ms\": 0,\n", .{});
-            try writer.print("  \"error_count\": {}\n", .{error_count});
+            try writeJsonSummaryFields(writer, .{
+                .total_size = totals.total_size,
+                .total_files = totals.total_files,
+                .total_dirs = totals.total_dirs,
+                .scan_time_ms = 0,
+                .error_count = totals.error_count,
+            });
             try writer.writeAll("}\n");
         },
     }
 }
 
 pub fn scan(io: std.Io, opts: Options) !ScanResult {
-    const allocator = std.heap.page_allocator;
+    if (isGeneratedDirPath(opts.path)) {
+        return .{
+            .total_size = 0,
+            .total_files = 0,
+            .total_dirs = 0,
+            .scan_time_ms = 0,
+            .error_count = 0,
+        };
+    }
 
-    var entries_list: std.ArrayList(Entry) = .empty;
-    var total_size: u64 = 0;
-    var total_files: u64 = 0;
-    var total_dirs: u64 = 0;
-    var error_count: u64 = 0;
+    const allocator = std.heap.page_allocator;
+    const start = std.Io.Timestamp.now(io, .awake);
+    var totals: ScanTotals = .{};
 
     var dir = try std.Io.Dir.cwd().openDir(io, opts.path, .{ .iterate = true });
     defer dir.close(io);
 
     var iter = dir.iterate();
-    try walkDir(allocator, io, &entries_list, opts, if (opts.summarize) null else opts.path, dir, &iter, 0, &total_size, &total_files, &total_dirs, &error_count);
+    try walkDirTotals(allocator, io, opts, opts.path, dir, &iter, 0, &totals);
 
-    return ScanResult{
-        .entries = try entries_list.toOwnedSlice(allocator),
-        .total_size = total_size,
-        .total_files = total_files,
-        .total_dirs = total_dirs,
-        .scan_time_ms = 0,
-        .error_count = error_count,
+    const end = std.Io.Timestamp.now(io, .awake);
+    return .{
+        .total_size = totals.total_size,
+        .total_files = totals.total_files,
+        .total_dirs = totals.total_dirs,
+        .scan_time_ms = @as(u64, @intCast(@divFloor(start.durationTo(end).nanoseconds, std.time.ns_per_ms))),
+        .error_count = totals.error_count,
     };
 }
 
-fn fileSizeOnDisk(path: []const u8, allocator: mem.Allocator, io: std.Io) u64 {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return 0;
+fn isGeneratedDirPath(path: []const u8) bool {
+    return mem.eql(u8, path, "/proc") or mem.startsWith(u8, path, "/proc/");
+}
+
+fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+    const stat = dir.statFile(io, sub_path, .{ .follow_symlinks = false }) catch return 0;
     if (stat.kind != .file) return stat.size;
 
     return switch (builtin.os.tag) {
-        .linux, .macos => if (builtin.link_libc) allocatedFileSize(path, allocator) orelse stat.size else stat.size,
+        .linux, .macos => if (builtin.link_libc) allocatedFileSizeOrSparseFallback(dir, sub_path, stat.size) else stat.size,
         else => stat.size,
     };
 }
 
-fn allocatedFileSize(path: []const u8, allocator: mem.Allocator) ?u64 {
-    const path_z = allocator.dupeZ(u8, path) catch return null;
-    defer allocator.free(path_z);
+fn allocatedFileSizeOrSparseFallback(dir: std.Io.Dir, sub_path: []const u8, apparent_size: u64) u64 {
+    const allocated = allocatedFileSizeAt(dir, sub_path) orelse return apparent_size;
+    if (allocated == 0) return apparent_size;
+    return allocated;
+}
 
+fn allocatedFileSizeAt(dir: std.Io.Dir, sub_path: []const u8) ?u64 {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (sub_path.len + 1 > path_buf.len) return null;
+    @memcpy(path_buf[0..sub_path.len], sub_path);
+    path_buf[sub_path.len] = 0;
     var stat: std.c.Stat = undefined;
-    if (c_stat.fstatat(std.c.AT.FDCWD, path_z.ptr, &stat, std.c.AT.SYMLINK_NOFOLLOW) != 0) {
+    if (c_stat.fstatat(dir.handle, @ptrCast(path_buf[0..sub_path.len :0].ptr), &stat, std.c.AT.SYMLINK_NOFOLLOW) != 0) {
         return null;
     }
     if (stat.blocks < 0) return null;
@@ -162,12 +176,8 @@ fn walkDirStreaming(
     dir: std.Io.Dir,
     iter: *std.Io.Dir.Iterator,
     depth: usize,
-    entry_count: *usize,
     first_json_entry: *bool,
-    total_size: *u64,
-    total_files: *u64,
-    total_dirs: *u64,
-    error_count: *u64,
+    totals: *ScanTotals,
 ) !void {
     if (opts.max_depth) |max_depth| {
         if (depth >= max_depth) return;
@@ -175,72 +185,37 @@ fn walkDirStreaming(
 
     while (true) {
         const maybe_entry = iter.next(io) catch {
-            error_count.* += 1;
+            totals.error_count += 1;
             return;
         };
         const entry = maybe_entry orelse break;
         if (!opts.show_hidden and entry.name[0] == '.') continue;
         if (opts.max_entries) |max_entries| {
-            if (entry_count.* >= max_entries) return;
-        }
-
-        var size: u64 = 0;
-        var kind = entry.kind;
-        if (kind != .directory) {
-            const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch {
-                error_count.* += 1;
-                continue;
-            };
-            kind = stat.kind;
-            if (kind == .file) {
-                const full_path = try fs.path.join(allocator, &.{ current_path, entry.name });
-                defer allocator.free(full_path);
-                size = fileSizeOnDisk(full_path, allocator, io);
-            } else {
-                size = stat.size;
-            }
-        }
-
-        const is_dir = kind == .directory;
-        const is_file = kind == .file;
-
-        if (is_file) {
-            total_size.* += size;
-            total_files.* += 1;
-        } else if (is_dir) {
-            total_dirs.* += 1;
+            if (totals.entry_count >= max_entries) return;
         }
 
         const full_path = try fs.path.join(allocator, &.{ current_path, entry.name });
         defer allocator.free(full_path);
 
-        switch (opts.format) {
-            .human => {
-                const prefix = if (is_dir) "d" else if (is_file) "f" else "-";
-                try writer.print("{s} {:>10} {s}\n", .{ prefix, size, full_path });
-            },
-            .json => {
-                if (!first_json_entry.*) {
-                    try writer.writeAll(",\n");
-                }
-                first_json_entry.* = false;
-                try writer.writeAll("    {\n");
-                try writer.print("      \"name\": \"{s}\",\n", .{entry.name});
-                try writer.print("      \"path\": \"{s}\",\n", .{full_path});
-                try writer.print("      \"size\": {},\n", .{size});
-                try writer.print("      \"is_dir\": {},\n", .{is_dir});
-                try writer.print("      \"depth\": {}\n", .{depth});
-                try writer.writeAll("    }");
-            },
+        const kind = try entryKindAndSize(io, dir, entry.name, entry.kind, &totals.error_count);
+        const is_dir = kind.is_dir;
+        const is_file = kind.is_file;
+
+        if (is_dir and isGeneratedDirPath(full_path)) continue;
+
+        recordEntry(kind.size, is_dir, is_file, totals);
+
+        if (!opts.summarize) {
+            try writeEntry(writer, opts.format, entry.name, full_path, kind.size, is_dir, depth, first_json_entry);
         }
-        entry_count.* += 1;
+        totals.entry_count += 1;
 
         if (is_dir and (opts.max_depth == null or depth < opts.max_depth.?)) {
             var subdir = dir.openDir(io, entry.name, .{
                 .iterate = true,
                 .follow_symlinks = false,
             }) catch {
-                error_count.* += 1;
+                totals.error_count += 1;
                 continue;
             };
             defer subdir.close(io);
@@ -255,155 +230,189 @@ fn walkDirStreaming(
                 subdir,
                 &subiter,
                 depth + 1,
-                entry_count,
                 first_json_entry,
-                total_size,
-                total_files,
-                total_dirs,
-                error_count,
+                totals,
             );
         }
     }
 }
 
-fn walkDir(
+fn walkDirTotals(
     allocator: mem.Allocator,
     io: std.Io,
-    entries: *std.ArrayList(Entry),
     opts: Options,
-    current_path: ?[]const u8,
+    current_path: []const u8,
     dir: std.Io.Dir,
     iter: *std.Io.Dir.Iterator,
     depth: usize,
-    total_size: *u64,
-    total_files: *u64,
-    total_dirs: *u64,
-    error_count: *u64,
+    totals: *ScanTotals,
 ) !void {
     if (opts.max_depth) |max_depth| {
         if (depth >= max_depth) return;
     }
 
-    if (!opts.summarize) {
-        if (opts.max_entries) |max_entries| {
-            if (entries.items.len >= max_entries) return;
-        }
-    }
-
     while (true) {
         const maybe_entry = iter.next(io) catch {
-            error_count.* += 1;
+            totals.error_count += 1;
             return;
         };
         const entry = maybe_entry orelse break;
         if (!opts.show_hidden and entry.name[0] == '.') continue;
-
-        var size: u64 = 0;
-        var kind = entry.kind;
-
-        if (kind != .directory) {
-            const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch {
-                error_count.* += 1;
-                continue;
-            };
-            kind = stat.kind;
-            if (kind == .file) {
-                const parent_path = current_path orelse unreachable;
-                const full_path = try fs.path.join(allocator, &.{ parent_path, entry.name });
-                defer allocator.free(full_path);
-                size = fileSizeOnDisk(full_path, allocator, io);
-            } else {
-                size = stat.size;
-            }
+        if (opts.max_entries) |max_entries| {
+            if (totals.entry_count >= max_entries) return;
         }
 
-        const is_dir = kind == .directory;
-        const is_file = kind == .file;
-        const is_symlink = kind == .sym_link;
-
-        if (is_file) {
-            total_size.* += size;
-            total_files.* += 1;
-        } else if (is_dir) {
-            total_dirs.* += 1;
-        }
-
-        if (!opts.summarize) {
-            const parent_path = current_path orelse unreachable;
-            const full_path = try fs.path.join(allocator, &.{ parent_path, entry.name });
-            defer allocator.free(full_path);
-
-            try entries.append(allocator, Entry{
-                .name = try allocator.dupe(u8, entry.name),
-                .path = try allocator.dupe(u8, full_path),
-                .size = size,
-                .is_dir = is_dir,
-                .is_file = is_file,
-                .is_symlink = is_symlink,
-                .depth = depth,
-            });
-        }
+        const kind = try entryKindAndSize(io, dir, entry.name, entry.kind, &totals.error_count);
+        const is_dir = kind.is_dir;
+        const is_file = kind.is_file;
 
         if (is_dir and (opts.max_depth == null or depth < opts.max_depth.?)) {
+            const full_path = try fs.path.join(allocator, &.{ current_path, entry.name });
+            defer allocator.free(full_path);
+
+            if (isGeneratedDirPath(full_path)) continue;
+
+            recordEntry(kind.size, is_dir, is_file, totals);
+            totals.entry_count += 1;
+
             var subdir = dir.openDir(io, entry.name, .{
                 .iterate = true,
                 .follow_symlinks = false,
             }) catch {
-                error_count.* += 1;
+                totals.error_count += 1;
                 continue;
             };
             defer subdir.close(io);
 
             var subiter = subdir.iterate();
-            if (current_path) |parent_path| {
-                const child_path = try fs.path.join(allocator, &.{ parent_path, entry.name });
-                defer allocator.free(child_path);
-                try walkDir(allocator, io, entries, opts, child_path, subdir, &subiter, depth + 1, total_size, total_files, total_dirs, error_count);
-            } else {
-                try walkDir(allocator, io, entries, opts, null, subdir, &subiter, depth + 1, total_size, total_files, total_dirs, error_count);
+            try walkDirTotals(allocator, io, opts, full_path, subdir, &subiter, depth + 1, totals);
+            continue;
+        }
+
+        recordEntry(kind.size, is_dir, is_file, totals);
+        totals.entry_count += 1;
+    }
+}
+
+const SizedKind = struct {
+    is_dir: bool,
+    is_file: bool,
+    size: u64,
+};
+
+fn entryKindAndSize(
+    io: std.Io,
+    dir: std.Io.Dir,
+    name: []const u8,
+    initial_kind: anytype,
+    error_count: *u64,
+) !SizedKind {
+    var kind = initial_kind;
+    var size: u64 = 0;
+
+    if (kind != .directory) {
+        const stat = dir.statFile(io, name, .{ .follow_symlinks = false }) catch {
+            error_count.* += 1;
+            return .{ .is_dir = kind == .directory, .is_file = kind == .file, .size = 0 };
+        };
+        kind = stat.kind;
+        size = if (kind == .file) fileSizeOnDiskAt(dir, name, io) else stat.size;
+    }
+
+    return .{ .is_dir = kind == .directory, .is_file = kind == .file, .size = size };
+}
+
+fn recordEntry(size: u64, is_dir: bool, is_file: bool, totals: *ScanTotals) void {
+    if (is_file) {
+        totals.total_size += size;
+        totals.total_files += 1;
+    } else if (is_dir) {
+        totals.total_dirs += 1;
+    }
+}
+
+fn writeEntry(
+    writer: anytype,
+    format: Format,
+    name: []const u8,
+    path: []const u8,
+    size: u64,
+    is_dir: bool,
+    depth: usize,
+    first_json_entry: *bool,
+) !void {
+    switch (format) {
+        .human => {
+            const prefix = if (is_dir) "d" else "f";
+            try writer.print("{s} {:>10} {s}\n", .{ prefix, size, path });
+        },
+        .json => {
+            if (!first_json_entry.*) {
+                try writer.writeAll(",\n");
             }
+            first_json_entry.* = false;
+            try writer.writeAll("    {\n");
+            try writer.writeAll("      \"name\": ");
+            try writeJsonString(writer, name);
+            try writer.writeAll(",\n");
+            try writer.writeAll("      \"path\": ");
+            try writeJsonString(writer, path);
+            try writer.writeAll(",\n");
+            try writer.print("      \"size\": {},\n", .{size});
+            try writer.print("      \"is_dir\": {},\n", .{is_dir});
+            try writer.print("      \"depth\": {}\n", .{depth});
+            try writer.writeAll("    }");
+        },
+    }
+}
+
+fn writeHumanSummary(writer: anytype, result: ScanResult) !void {
+    try writer.writeAll("Summary:\n");
+    try writer.print("  Total size: {}\n", .{result.total_size});
+    try writer.print("  Files: {}\n", .{result.total_files});
+    try writer.print("  Directories: {}\n", .{result.total_dirs});
+    try writer.print("  Scan time: {}ms\n", .{result.scan_time_ms});
+    try writer.print("  Errors: {}\n", .{result.error_count});
+}
+
+fn writeJsonSummaryFields(writer: anytype, result: ScanResult) !void {
+    try writer.print("  \"total_size\": {},\n", .{result.total_size});
+    try writer.print("  \"total_files\": {},\n", .{result.total_files});
+    try writer.print("  \"total_dirs\": {},\n", .{result.total_dirs});
+    try writer.print("  \"scan_time_ms\": {},\n", .{result.scan_time_ms});
+    try writer.print("  \"error_count\": {}\n", .{result.error_count});
+}
+
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try writer.writeAll("\"");
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0c => try writer.writeAll("\\f"),
+            0x00...0x1f => {
+                const escaped = [_]u8{ '\\', 'u', '0', '0', hex[@as(usize, byte >> 4)], hex[@as(usize, byte & 0x0f)] };
+                try writer.writeAll(&escaped);
+            },
+            else => try writer.writeAll(&[_]u8{byte}),
         }
     }
+    try writer.writeAll("\"");
 }
 
 pub fn formatResult(result: ScanResult, opts: Options, writer: anytype) !void {
     switch (opts.format) {
-        .human => {
-            if (!opts.summarize) {
-                try writer.writeAll("Entries:\n");
-                for (result.entries) |entry| {
-                    const prefix = if (entry.is_dir) "d" else if (entry.is_file) "f" else "-";
-                    try writer.print("{s} {:>10} {s}\n", .{ prefix, entry.size, entry.path });
-                }
-                try writer.writeAll("\n");
-            }
-            try writer.writeAll("Summary:\n");
-            try writer.print("  Total size: {}\n", .{result.total_size});
-            try writer.print("  Files: {}\n", .{result.total_files});
-            try writer.print("  Directories: {}\n", .{result.total_dirs});
-            try writer.print("  Scan time: {}ms\n", .{result.scan_time_ms});
-            try writer.print("  Errors: {}\n", .{result.error_count});
-        },
+        .human => try writeHumanSummary(writer, result),
         .json => {
             try writer.writeAll("{\n");
             try writer.writeAll("  \"entries\": [\n");
-            if (!opts.summarize) {
-                for (result.entries, 0..) |entry, idx| {
-                    try writer.writeAll("    {\n");
-                    try writer.print("      \"name\": \"{s}\",\n", .{entry.name});
-                    try writer.print("      \"path\": \"{s}\",\n", .{entry.path});
-                    try writer.print("      \"size\": {},\n", .{entry.size});
-                    try writer.print("      \"is_dir\": {},\n", .{entry.is_dir});
-                    try writer.print("      \"depth\": {}\n", .{entry.depth});
-                    try writer.writeAll(if (idx + 1 == result.entries.len) "    }\n" else "    },\n");
-                }
-            }
             try writer.writeAll("  ],\n");
-            try writer.print("  \"total_size\": {},\n", .{result.total_size});
-            try writer.print("  \"total_files\": {},\n", .{result.total_files});
-            try writer.print("  \"total_dirs\": {},\n", .{result.total_dirs});
-            try writer.print("  \"scan_time_ms\": {},\n", .{result.scan_time_ms});
-            try writer.print("  \"error_count\": {}\n", .{result.error_count});
+            try writeJsonSummaryFields(writer, result);
             try writer.writeAll("}\n");
         },
     }
@@ -426,13 +435,12 @@ test "Options defaults" {
 }
 
 test "Format enum values" {
-    try std.testing.expectEqual(@as(Format, 0), .human);
-    try std.testing.expectEqual(@as(Format, 1), .json);
+    try std.testing.expectEqual(Format.human, .human);
+    try std.testing.expectEqual(Format.json, .json);
 }
 
 test "ScanResult init" {
     const result = ScanResult{
-        .entries = &.{},
         .total_size = 1024,
         .total_files = 5,
         .total_dirs = 2,
@@ -444,17 +452,21 @@ test "ScanResult init" {
     try std.testing.expectEqual(@as(u64, 2), result.total_dirs);
 }
 
-test "Entry init" {
-    const entry = Entry{
-        .name = "test",
-        .path = "/test",
-        .size = 512,
-        .is_dir = false,
-        .is_file = true,
-        .is_symlink = false,
-        .depth = 0,
-    };
-    try std.testing.expect(entry.is_file);
-    try std.testing.expect(!entry.is_dir);
-    try std.testing.expectEqual(@as(u64, 512), entry.size);
+test "scan skips /proc entirely" {
+    const result = try scan(std.testing.io, .{
+        .path = "/proc",
+        .format = .human,
+        .summarize = false,
+        .show_hidden = true,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+        .use_io_uring = false,
+    });
+
+    try std.testing.expectEqual(@as(u64, 0), result.total_size);
+    try std.testing.expectEqual(@as(u64, 0), result.total_files);
+    try std.testing.expectEqual(@as(u64, 0), result.total_dirs);
+    try std.testing.expectEqual(@as(u64, 0), result.error_count);
 }
