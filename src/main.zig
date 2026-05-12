@@ -721,7 +721,12 @@ pub const Model = struct {
     fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
         return switch (builtin.os.tag) {
             .linux => if (builtin.link_libc) fileSizeOnDiskWithLibcAt(dir, sub_path, io) else fileSizeOnDiskFallbackAt(dir, sub_path, io),
-            .macos => fileSizeOnDiskFallbackAt(dir, sub_path, io),
+            .macos => if (builtin.cpu.arch == .x86_64)
+                fileSizeOnDiskFallbackAt(dir, sub_path, io)
+            else if (builtin.link_libc)
+                fileSizeOnDiskWithLibcAt(dir, sub_path, io)
+            else
+                fileSizeOnDiskFallbackAt(dir, sub_path, io),
             else => fileSizeOnDiskFallbackAt(dir, sub_path, io),
         };
     }
