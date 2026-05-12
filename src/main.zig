@@ -119,18 +119,75 @@ pub const Model = struct {
         started_at: std.Io.Timestamp,
     };
 
+    fn createModel(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !*Model {
+        const model = try allocator.create(Model);
+        errdefer allocator.destroy(model);
+
+        const owned_cwd = try allocator.dupe(u8, cwd);
+        errdefer allocator.free(owned_cwd);
+
+        model.* = .{
+            .io = io,
+            .allocator = allocator,
+            .cwd = owned_cwd,
+            .cache_ttl_seconds = cache_ttl_seconds,
+        };
+        return model;
+    }
+
+    fn allocEntryOwned(
+        allocator: mem.Allocator,
+        name: []const u8,
+        path: ?[]const u8,
+        size: u64,
+        is_dir: bool,
+        role: EntryRole,
+    ) !Entry {
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+
+        var owned_path: ?[]u8 = null;
+        errdefer if (owned_path) |value| allocator.free(value);
+        if (path) |value| {
+            owned_path = try allocator.dupe(u8, value);
+        }
+
+        return .{
+            .name = owned_name,
+            .path = owned_path,
+            .size = size,
+            .is_dir = is_dir,
+            .role = role,
+        };
+    }
+
+    fn pushLoadingFrame(loading: *Loading, allocator: mem.Allocator, io: std.Io, dir: std.Io.Dir, entry_index: usize) !void {
+        var owned_dir = dir;
+        errdefer owned_dir.close(io);
+        try loading.scan_stack.append(allocator, .{
+            .dir = owned_dir,
+            .iter = owned_dir.iterateAssumeFirstIteration(),
+            .entry_index = entry_index,
+            .total = 0,
+        });
+    }
+
+    fn pushDirStatsFrame(stack: *std.ArrayList(StackFrame), allocator: mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
+        var owned_dir = dir;
+        errdefer owned_dir.close(io);
+        try stack.append(allocator, .{
+            .dir = owned_dir,
+            .iter = owned_dir.iterateAssumeFirstIteration(),
+        });
+    }
+
     pub fn init(io: std.Io, allocator: mem.Allocator, cwd: []const u8) !*Model {
         return initWithCache(io, allocator, cwd, 0);
     }
 
     pub fn initWithCache(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !*Model {
-        const model = try allocator.create(Model);
-        model.* = .{
-            .io = io,
-            .allocator = allocator,
-            .cwd = try allocator.dupe(u8, cwd),
-            .cache_ttl_seconds = cache_ttl_seconds,
-        };
+        const model = try createModel(io, allocator, cwd, cache_ttl_seconds);
+        errdefer model.deinit();
         try model.primeDirXattrs();
         try model.loadDir();
         return model;
@@ -141,13 +198,8 @@ pub const Model = struct {
     }
 
     pub fn initLoadingWithCache(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !*Model {
-        const model = try allocator.create(Model);
-        model.* = .{
-            .io = io,
-            .allocator = allocator,
-            .cwd = try allocator.dupe(u8, cwd),
-            .cache_ttl_seconds = cache_ttl_seconds,
-        };
+        const model = try createModel(io, allocator, cwd, cache_ttl_seconds);
+        errdefer model.deinit();
         try model.beginLoading();
         return model;
     }
@@ -247,13 +299,14 @@ pub const Model = struct {
         errdefer freeEntryItems(model.allocator, entries_list.items);
 
         if (model.parent) |parent| {
-            try entries_list.append(model.allocator, .{
-                .name = try model.allocator.dupe(u8, ".."),
-                .path = try model.allocator.dupe(u8, parent.cwd),
-                .size = readCachedDirSize(parent.cwd, model.allocator) orelse 0,
-                .is_dir = true,
-                .role = .parent,
-            });
+            try entries_list.append(model.allocator, try allocEntryOwned(
+                model.allocator,
+                "..",
+                parent.cwd,
+                readCachedDirSize(parent.cwd, model.allocator) orelse 0,
+                true,
+                .parent,
+            ));
         }
 
         var iter = dir.iterate();
@@ -267,12 +320,14 @@ pub const Model = struct {
                 break :blk fileSizeOnDiskAt(dir, entry.name, model.io);
             };
 
-            try entries_list.append(model.allocator, .{
-                .name = try model.allocator.dupe(u8, entry.name),
-                .size = size,
-                .is_dir = entry.kind == .directory,
-                .role = .item,
-            });
+            try entries_list.append(model.allocator, try allocEntryOwned(
+                model.allocator,
+                entry.name,
+                null,
+                size,
+                entry.kind == .directory,
+                .item,
+            ));
         }
 
         mem.sortUnstable(Entry, entries_list.items, {}, struct {
@@ -312,13 +367,14 @@ pub const Model = struct {
         errdefer dir.close(model.io);
 
         if (model.parent) |parent| {
-            try entries_list.append(model.allocator, .{
-                .name = try model.allocator.dupe(u8, ".."),
-                .path = try model.allocator.dupe(u8, parent.cwd),
-                .size = readCachedDirSize(parent.cwd, model.allocator) orelse 0,
-                .is_dir = true,
-                .role = .parent,
-            });
+            try entries_list.append(model.allocator, try allocEntryOwned(
+                model.allocator,
+                "..",
+                parent.cwd,
+                readCachedDirSize(parent.cwd, model.allocator) orelse 0,
+                true,
+                .parent,
+            ));
         }
 
         var iter = dir.iterate();
@@ -329,12 +385,14 @@ pub const Model = struct {
                 if (isGeneratedDirPath(full_path)) continue;
             }
 
-            try entries_list.append(model.allocator, .{
-                .name = try model.allocator.dupe(u8, entry.name),
-                .size = 0,
-                .is_dir = entry.kind == .directory,
-                .role = .item,
-            });
+            try entries_list.append(model.allocator, try allocEntryOwned(
+                model.allocator,
+                entry.name,
+                null,
+                0,
+                entry.kind == .directory,
+                .item,
+            ));
         }
 
         model.entries = try entries_list.toOwnedSlice(model.allocator);
@@ -405,12 +463,7 @@ pub const Model = struct {
                         }
                     }
                     loading.processed_dirs += 1;
-                    try loading.scan_stack.append(model.allocator, .{
-                        .dir = dir,
-                        .iter = dir.iterateAssumeFirstIteration(),
-                        .entry_index = frame.entry_index,
-                        .total = 0,
-                    });
+                    try pushLoadingFrame(loading, model.allocator, model.io, dir, frame.entry_index);
                     return true;
                 }
 
@@ -460,12 +513,7 @@ pub const Model = struct {
             }
         }
         loading.processed_dirs += 1;
-        try loading.scan_stack.append(model.allocator, .{
-            .dir = dir,
-            .iter = dir.iterateAssumeFirstIteration(),
-            .entry_index = idx,
-            .total = 0,
-        });
+        try pushLoadingFrame(loading, model.allocator, model.io, dir, idx);
         return true;
     }
 
@@ -490,13 +538,8 @@ pub const Model = struct {
         }
 
         const updated = try model.allocator.alloc(Entry, model.entries.len + 1);
-        updated[0] = .{
-            .name = try model.allocator.dupe(u8, ""),
-            .path = try model.allocator.dupe(u8, model.cwd),
-            .size = total_size,
-            .is_dir = true,
-            .role = .summary,
-        };
+        errdefer model.allocator.free(updated);
+        updated[0] = try allocEntryOwned(model.allocator, "", model.cwd, total_size, true, .summary);
         @memcpy(updated[1..], model.entries);
         model.allocator.free(model.entries);
         model.entries = updated;
@@ -533,13 +576,7 @@ pub const Model = struct {
             if (entry.role == .item) total_size += entry.size;
         }
 
-        try entries.insert(allocator, 0, .{
-            .name = try allocator.dupe(u8, ""),
-            .path = try allocator.dupe(u8, cwd),
-            .size = total_size,
-            .is_dir = true,
-            .role = .summary,
-        });
+        try entries.insert(allocator, 0, try allocEntryOwned(allocator, "", cwd, total_size, true, .summary));
     }
 
     fn ensureSelectionVisible(model: *Model, visible_rows: usize) void {
@@ -627,7 +664,7 @@ pub const Model = struct {
                 return .{ .size = cached_size, .dir_count = 1 };
             }
         }
-        try stack.append(allocator, .{ .dir = root_dir, .iter = root_dir.iterateAssumeFirstIteration() });
+        try pushDirStatsFrame(&stack, allocator, io, root_dir);
 
         var dir_count: u64 = 1;
 
@@ -648,10 +685,7 @@ pub const Model = struct {
                             continue;
                         }
                     }
-                    try stack.append(allocator, .{
-                        .dir = subdir,
-                        .iter = subdir.iterateAssumeFirstIteration(),
-                    });
+                    try pushDirStatsFrame(&stack, allocator, io, subdir);
                     dir_count += 1;
                     continue;
                 }
