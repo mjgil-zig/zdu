@@ -157,13 +157,13 @@ fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?std.c.Stat {
 
 fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
     return switch (builtin.os.tag) {
-        .linux, .macos => if (builtin.link_libc) fileSizeOnDiskWithLibcAt(dir, sub_path) else fileSizeOnDiskFallbackAt(dir, sub_path, io),
+        .linux, .macos => if (builtin.link_libc) fileSizeOnDiskWithLibcAt(dir, sub_path, io) else fileSizeOnDiskFallbackAt(dir, sub_path, io),
         else => fileSizeOnDiskFallbackAt(dir, sub_path, io),
     };
 }
 
-fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8) u64 {
-    const stat = cStatAt(dir, sub_path) orelse return 0;
+fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+    const stat = cStatAt(dir, sub_path) orelse return fileSizeOnDiskFallbackAt(dir, sub_path, io);
     const apparent_size: u64 = if (stat.size < 0) 0 else @intCast(stat.size);
     if (!std.c.S.ISREG(stat.mode)) return apparent_size;
     if (stat.blocks <= 0) return apparent_size;
