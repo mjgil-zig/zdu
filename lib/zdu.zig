@@ -122,7 +122,8 @@ pub fn scan(io: std.Io, opts: Options) !ScanResult {
     defer dir.close(io);
 
     var iter = dir.iterate();
-    try walkDirTotals(allocator, io, opts, opts.path, dir, &iter, 0, &totals);
+    const check_generated_paths = pathNeedsGeneratedDirChecks(opts.path);
+    try walkDirTotals(allocator, io, opts, if (check_generated_paths) opts.path else null, check_generated_paths, dir, &iter, 0, &totals);
 
     const end = std.Io.Timestamp.now(io, .awake);
     return .{
@@ -138,23 +139,11 @@ fn isGeneratedDirPath(path: []const u8) bool {
     return mem.eql(u8, path, "/proc") or mem.startsWith(u8, path, "/proc/");
 }
 
-fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
-    const stat = dir.statFile(io, sub_path, .{ .follow_symlinks = false }) catch return 0;
-    if (stat.kind != .file) return stat.size;
-
-    return switch (builtin.os.tag) {
-        .linux, .macos => if (builtin.link_libc) allocatedFileSizeOrSparseFallback(dir, sub_path, stat.size) else stat.size,
-        else => stat.size,
-    };
+fn pathNeedsGeneratedDirChecks(path: []const u8) bool {
+    return mem.eql(u8, path, "/") or isGeneratedDirPath(path);
 }
 
-fn allocatedFileSizeOrSparseFallback(dir: std.Io.Dir, sub_path: []const u8, apparent_size: u64) u64 {
-    const allocated = allocatedFileSizeAt(dir, sub_path) orelse return apparent_size;
-    if (allocated == 0) return apparent_size;
-    return allocated;
-}
-
-fn allocatedFileSizeAt(dir: std.Io.Dir, sub_path: []const u8) ?u64 {
+fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?std.c.Stat {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (sub_path.len + 1 > path_buf.len) return null;
     @memcpy(path_buf[0..sub_path.len], sub_path);
@@ -163,8 +152,27 @@ fn allocatedFileSizeAt(dir: std.Io.Dir, sub_path: []const u8) ?u64 {
     if (c_stat.fstatat(dir.handle, @ptrCast(path_buf[0..sub_path.len :0].ptr), &stat, std.c.AT.SYMLINK_NOFOLLOW) != 0) {
         return null;
     }
-    if (stat.blocks < 0) return null;
+    return stat;
+}
+
+fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+    return switch (builtin.os.tag) {
+        .linux, .macos => if (builtin.link_libc) fileSizeOnDiskWithLibcAt(dir, sub_path) else fileSizeOnDiskFallbackAt(dir, sub_path, io),
+        else => fileSizeOnDiskFallbackAt(dir, sub_path, io),
+    };
+}
+
+fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8) u64 {
+    const stat = cStatAt(dir, sub_path) orelse return 0;
+    const apparent_size: u64 = if (stat.size < 0) 0 else @intCast(stat.size);
+    if (!std.c.S.ISREG(stat.mode)) return apparent_size;
+    if (stat.blocks <= 0) return apparent_size;
     return @as(u64, @intCast(stat.blocks)) * 512;
+}
+
+fn fileSizeOnDiskFallbackAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+    const stat = dir.statFile(io, sub_path, .{ .follow_symlinks = false }) catch return 0;
+    return stat.size;
 }
 
 fn walkDirStreaming(
@@ -241,7 +249,8 @@ fn walkDirTotals(
     allocator: mem.Allocator,
     io: std.Io,
     opts: Options,
-    current_path: []const u8,
+    current_path: ?[]const u8,
+    check_generated_paths: bool,
     dir: std.Io.Dir,
     iter: *std.Io.Dir.Iterator,
     depth: usize,
@@ -267,10 +276,14 @@ fn walkDirTotals(
         const is_file = kind.is_file;
 
         if (is_dir and (opts.max_depth == null or depth < opts.max_depth.?)) {
-            const full_path = try fs.path.join(allocator, &.{ current_path, entry.name });
-            defer allocator.free(full_path);
+            var full_path: ?[]const u8 = null;
+            defer if (full_path) |path| allocator.free(path);
 
-            if (isGeneratedDirPath(full_path)) continue;
+            if (check_generated_paths) {
+                const parent_path = current_path orelse unreachable;
+                full_path = try fs.path.join(allocator, &.{ parent_path, entry.name });
+                if (isGeneratedDirPath(full_path.?)) continue;
+            }
 
             recordEntry(kind.size, is_dir, is_file, totals);
             totals.entry_count += 1;
@@ -285,7 +298,17 @@ fn walkDirTotals(
             defer subdir.close(io);
 
             var subiter = subdir.iterate();
-            try walkDirTotals(allocator, io, opts, full_path, subdir, &subiter, depth + 1, totals);
+            try walkDirTotals(
+                allocator,
+                io,
+                opts,
+                full_path,
+                check_generated_paths and pathNeedsGeneratedDirChecks(full_path.?),
+                subdir,
+                &subiter,
+                depth + 1,
+                totals,
+            );
             continue;
         }
 
@@ -307,19 +330,31 @@ fn entryKindAndSize(
     initial_kind: anytype,
     error_count: *u64,
 ) !SizedKind {
-    var kind = initial_kind;
-    var size: u64 = 0;
-
-    if (kind != .directory) {
-        const stat = dir.statFile(io, name, .{ .follow_symlinks = false }) catch {
-            error_count.* += 1;
-            return .{ .is_dir = kind == .directory, .is_file = kind == .file, .size = 0 };
-        };
-        kind = stat.kind;
-        size = if (kind == .file) fileSizeOnDiskAt(dir, name, io) else stat.size;
+    if (initial_kind == .directory) {
+        return .{ .is_dir = true, .is_file = false, .size = 0 };
     }
 
-    return .{ .is_dir = kind == .directory, .is_file = kind == .file, .size = size };
+    if (builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos)) {
+        const stat = cStatAt(dir, name) orelse {
+            error_count.* += 1;
+            return .{ .is_dir = false, .is_file = initial_kind == .file, .size = 0 };
+        };
+        const is_dir = std.c.S.ISDIR(stat.mode);
+        const is_file = std.c.S.ISREG(stat.mode);
+        const apparent_size: u64 = if (stat.size < 0) 0 else @intCast(stat.size);
+        const size = if (is_file and stat.blocks > 0) @as(u64, @intCast(stat.blocks)) * 512 else apparent_size;
+        return .{ .is_dir = is_dir, .is_file = is_file, .size = size };
+    }
+
+    const stat = dir.statFile(io, name, .{ .follow_symlinks = false }) catch {
+        error_count.* += 1;
+        return .{ .is_dir = false, .is_file = initial_kind == .file, .size = 0 };
+    };
+    return .{
+        .is_dir = stat.kind == .directory,
+        .is_file = stat.kind == .file,
+        .size = stat.size,
+    };
 }
 
 fn recordEntry(size: u64, is_dir: bool, is_file: bool, totals: *ScanTotals) void {
