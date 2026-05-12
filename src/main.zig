@@ -1234,42 +1234,29 @@ pub const Model = struct {
         const done = loading.processed;
         const processed_bytes = loading.processed_bytes;
         const processed_dirs = loading.processed_dirs;
-        const entries_bytes = entriesStorageBytes(model.entries);
-        const stack_bytes = @as(u64, @intCast(loading.scan_stack.capacity * @sizeOf(ScanFrame)));
-        const retained_bytes = entries_bytes + stack_bytes;
-
         const elapsed_ns = @max(@as(i128, 0), loading.started_at.durationTo(std.Io.Timestamp.now(model.io, .awake)).nanoseconds);
         var elapsed_buf: [32]u8 = undefined;
         const elapsed_text = formatDuration(&elapsed_buf, @as(u64, @intCast(elapsed_ns / std.time.ns_per_ms)));
         var processed_buf: [32]u8 = undefined;
         const processed_text = formatSize(&processed_buf, processed_bytes);
         const dir_label = if (processed_dirs == 1) "directory" else "directories";
-        var retained_buf: [32]u8 = undefined;
-        const retained_text = formatSize(&retained_buf, retained_bytes);
-        var entries_buf: [32]u8 = undefined;
-        const entries_text = formatSize(&entries_buf, entries_bytes);
-        var stack_buf: [32]u8 = undefined;
-        const stack_text = formatSize(&stack_buf, stack_bytes);
 
         const title = "Loading directory";
         const spinner = loading_frames[model.spinner_frame];
         const status = try std.fmt.allocPrint(allocator, "{s} {d}/{d} entries", .{ spinner, done, total });
         const detail = try std.fmt.allocPrint(allocator, "Processed: {s}", .{processed_text});
         const meta = try std.fmt.allocPrint(allocator, "{d} {s}   Elapsed: {s}", .{ processed_dirs, dir_label, elapsed_text });
-        const retained = try std.fmt.allocPrint(allocator, "Retained~ {s}  entries {s}  stack {s}", .{ retained_text, entries_text, stack_text });
 
         const start_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(title.len)))) / 2));
         const status_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(status.len)))) / 2));
         const detail_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(detail.len)))) / 2));
         const meta_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(meta.len)))) / 2));
-        const retained_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(retained.len)))) / 2));
         const center_row = height / 2;
 
         try writeText(surface, allocator, title, center_row -| 2, start_col, .{ .fg = .{ .index = 15 }, .bold = true });
         try writeText(surface, allocator, status, center_row -| 1, status_col, .{ .fg = .{ .index = 12 } });
         try writeText(surface, allocator, detail, center_row, detail_col, .{ .fg = .{ .index = 10 } });
-        try writeText(surface, allocator, meta, center_row + 1, meta_col, .{ .fg = .{ .index = 8 } });
-        try writeText(surface, allocator, retained, center_row + 2, retained_col, .{ .fg = .{ .index = 11 } });
+        try writeText(surface, allocator, meta, center_row + 1, meta_col, .{ .fg = .{ .index = 7 } });
     }
 
     pub fn draw(model: *Model, ctx: vxfw.DrawContext) mem.Allocator.Error!vxfw.Surface {
