@@ -67,15 +67,24 @@ pub const Model = struct {
     const loading_frames = [_][]const u8{ "|", "/", "-", "\\" };
     const loading_tick_ms: u32 = 16;
     const dir_size_xattr_name: [:0]const u8 = "user.zdu.dir_size.v2";
+    const dir_stats_xattr_name: [:0]const u8 = "user.zdu.dir_stats.v3";
 
     const CachedDirSize = struct {
         size: u64,
         expires_at: u64,
     };
 
-    const DirStats = struct {
+    const CachedDirStats = struct {
         size: u64,
+        file_count: u64,
         dir_count: u64,
+        expires_at: u64,
+    };
+
+    const DirStats = struct {
+        size: u64 = 0,
+        file_count: u64 = 0,
+        dir_count: u64 = 0,
     };
 
     const EntryRole = enum {
@@ -88,6 +97,8 @@ pub const Model = struct {
         name: []u8,
         path: ?[]u8 = null,
         size: u64,
+        file_count: u64 = 0,
+        dir_count: u64 = 0,
         is_dir: bool,
         role: EntryRole = .item,
     };
@@ -95,18 +106,19 @@ pub const Model = struct {
     const ConfirmDelete = struct {
         path: []u8,
         is_dir: bool,
-        size: u64,
+        stats: DirStats,
+        entry_index: usize,
     };
 
     const ScanFrame = struct {
         dir: std.Io.Dir,
         iter: std.Io.Dir.Iterator,
         entry_index: usize,
-        total: u64 = 0,
+        total: DirStats = .{ .dir_count = 1 },
     };
 
     const CachedOrOpenDir = union(enum) {
-        cached_size: u64,
+        cached_stats: DirStats,
         dir: std.Io.Dir,
     };
 
@@ -140,7 +152,7 @@ pub const Model = struct {
         allocator: mem.Allocator,
         name: []const u8,
         path: ?[]const u8,
-        size: u64,
+        stats: DirStats,
         is_dir: bool,
         role: EntryRole,
     ) !Entry {
@@ -156,10 +168,48 @@ pub const Model = struct {
         return .{
             .name = owned_name,
             .path = owned_path,
-            .size = size,
+            .size = stats.size,
+            .file_count = stats.file_count,
+            .dir_count = stats.dir_count,
             .is_dir = is_dir,
             .role = role,
         };
+    }
+
+    fn fileEntryStats(size: u64) DirStats {
+        return .{ .size = size, .file_count = 1, .dir_count = 0 };
+    }
+
+    fn dirEntryStats(size: u64, file_count: u64, dir_count: u64) DirStats {
+        return .{ .size = size, .file_count = file_count, .dir_count = dir_count };
+    }
+
+    fn addStats(total: *DirStats, value: DirStats) void {
+        total.size += value.size;
+        total.file_count += value.file_count;
+        total.dir_count += value.dir_count;
+    }
+
+    fn subtractStats(total: DirStats, value: DirStats) ?DirStats {
+        if (value.size > total.size) return null;
+        if (value.file_count > total.file_count) return null;
+        if (value.dir_count > total.dir_count) return null;
+        return .{
+            .size = total.size - value.size,
+            .file_count = total.file_count - value.file_count,
+            .dir_count = total.dir_count - value.dir_count,
+        };
+    }
+
+    fn statsFromEntry(entry: Entry) DirStats {
+        if (entry.is_dir) {
+            return .{
+                .size = entry.size,
+                .file_count = entry.file_count,
+                .dir_count = if (entry.dir_count == 0) 1 else entry.dir_count,
+            };
+        }
+        return .{ .size = entry.size, .file_count = 1, .dir_count = 0 };
     }
 
     fn pushLoadingFrame(loading: *Loading, allocator: mem.Allocator, io: std.Io, dir: std.Io.Dir, entry_index: usize) !void {
@@ -169,7 +219,7 @@ pub const Model = struct {
             .dir = owned_dir,
             .iter = owned_dir.iterateAssumeFirstIteration(),
             .entry_index = entry_index,
-            .total = 0,
+            .total = .{ .dir_count = 1 },
         });
     }
 
@@ -182,12 +232,12 @@ pub const Model = struct {
         });
     }
 
-    fn openChildDirForScan(parent_dir: std.Io.Dir, io: std.Io, name: []const u8, cache_ttl_seconds: u64) ?CachedOrOpenDir {
+    fn openChildDirForScan(parent_dir: std.Io.Dir, io: std.Io, name: []const u8, cache_ttl_seconds: u64, read_cache: bool) ?CachedOrOpenDir {
         var dir = parent_dir.openDir(io, name, .{ .iterate = true }) catch return null;
-        if (cache_ttl_seconds > 0) {
-            if (readCachedDirSizeFd(dir)) |cached_size| {
+        if (read_cache and cache_ttl_seconds > 0) {
+            if (readCachedDirStatsFd(dir)) |cached_stats| {
                 dir.close(io);
-                return .{ .cached_size = cached_size };
+                return .{ .cached_stats = cached_stats };
             }
         }
         return .{ .dir = dir };
@@ -293,12 +343,22 @@ pub const Model = struct {
         }.less);
     }
 
-    fn totalItemSize(entries: []const Entry) u64 {
-        var total_size: u64 = 0;
+    fn totalItemStats(entries: []const Entry) DirStats {
+        var total: DirStats = .{};
         for (entries) |entry| {
-            if (entry.role == .item) total_size += entry.size;
+            if (entry.role == .item) addStats(&total, statsFromEntry(entry));
         }
-        return total_size;
+        return total;
+    }
+
+    fn currentDirStatsFromEntries(entries: []const Entry) DirStats {
+        var stats = totalItemStats(entries);
+        stats.dir_count += 1;
+        return stats;
+    }
+
+    fn totalItemSize(entries: []const Entry) u64 {
+        return totalItemStats(entries).size;
     }
 
     const InitialEntryMode = enum {
@@ -312,7 +372,7 @@ pub const Model = struct {
                 model.allocator,
                 "..",
                 parent.cwd,
-                readCachedDirSize(parent.cwd, model.allocator) orelse 0,
+                readCachedDirStats(parent.cwd, model.allocator) orelse .{},
                 true,
                 .parent,
             ));
@@ -322,20 +382,21 @@ pub const Model = struct {
     fn appendInitialEntries(model: *Model, dir: std.Io.Dir, entries_list: *std.ArrayList(Entry), mode: InitialEntryMode) !void {
         var iter = dir.iterate();
         while (iter.next(model.io) catch null) |entry| {
-            const size: u64 = switch (mode) {
-                .eager => if (entry.kind == .directory) blk: {
+            const is_dir = entry.kind == .directory;
+            const stats: DirStats = switch (mode) {
+                .eager => if (is_dir) blk: {
                     const full_path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name });
                     defer model.allocator.free(full_path);
                     if (zdu.isGeneratedDirPath(full_path)) continue;
-                    break :blk readCachedDirSize(full_path, model.allocator) orelse 0;
-                } else fileSizeOnDiskAt(dir, entry.name, model.io),
+                    break :blk readCachedDirStats(full_path, model.allocator) orelse .{};
+                } else fileEntryStats(fileSizeOnDiskAt(dir, entry.name, model.io)),
                 .loading => blk: {
-                    if (entry.kind == .directory) {
+                    if (is_dir) {
                         const full_path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name });
                         defer model.allocator.free(full_path);
                         if (zdu.isGeneratedDirPath(full_path)) continue;
                     }
-                    break :blk 0;
+                    break :blk if (is_dir) DirStats{} else fileEntryStats(0);
                 },
             };
 
@@ -343,8 +404,8 @@ pub const Model = struct {
                 model.allocator,
                 entry.name,
                 null,
-                size,
-                entry.kind == .directory,
+                stats,
+                is_dir,
                 .item,
             ));
         }
@@ -390,7 +451,7 @@ pub const Model = struct {
             try prependRootSummary(model.allocator, &entries_list, model.cwd);
         }
 
-        writeCachedDirSizeFd(dir, totalItemSize(entries_list.items), model.cache_ttl_seconds);
+        writeCachedDirStatsFd(dir, currentDirStatsFromEntries(entries_list.items), model.cache_ttl_seconds);
         model.entries = try entries_list.toOwnedSlice(model.allocator);
         model.resetEntryView();
     }
@@ -451,17 +512,17 @@ pub const Model = struct {
             var frame = &loading.scan_stack.items[loading.scan_stack.items.len - 1];
             if (frame.iter.next(model.io) catch null) |entry| {
                 if (entry.kind == .file) {
-                    const size = fileSizeOnDiskAt(frame.dir, entry.name, model.io);
-                    frame.total += size;
-                    loading.processed_bytes += size;
+                    const stats = fileEntryStats(fileSizeOnDiskAt(frame.dir, entry.name, model.io));
+                    addStats(&frame.total, stats);
+                    loading.processed_bytes += stats.size;
                     return true;
                 }
 
                 if (entry.kind == .directory) {
-                    switch (openChildDirForScan(frame.dir, model.io, entry.name, model.cache_ttl_seconds) orelse return true) {
-                        .cached_size => |cached_size| {
-                            frame.total += cached_size;
-                            loading.processed_bytes += cached_size;
+                    switch (openChildDirForScan(frame.dir, model.io, entry.name, model.cache_ttl_seconds, true) orelse return true) {
+                        .cached_stats => |cached_stats| {
+                            addStats(&frame.total, cached_stats);
+                            loading.processed_bytes += cached_stats.size;
                             loading.processed_dirs += 1;
                             return true;
                         },
@@ -477,11 +538,11 @@ pub const Model = struct {
             }
 
             const completed = loading.scan_stack.pop().?;
-            writeCachedDirSizeFd(completed.dir, completed.total, model.cache_ttl_seconds);
+            writeCachedDirStatsFd(completed.dir, completed.total, model.cache_ttl_seconds);
             completed.dir.close(model.io);
 
             if (loading.scan_stack.items.len > 0) {
-                loading.scan_stack.items[loading.scan_stack.items.len - 1].total += completed.total;
+                addStats(&loading.scan_stack.items[loading.scan_stack.items.len - 1].total, completed.total);
             } else {
                 try model.finalizeLoadingEntry(completed.entry_index, completed.total, true);
             }
@@ -499,20 +560,20 @@ pub const Model = struct {
         }
 
         if (!entry.is_dir) {
-            const size = fileSizeOnDiskAt(loading.root_dir, entry.name, model.io);
-            loading.processed_bytes += size;
-            try model.finalizeLoadingEntry(idx, size, false);
+            const stats = fileEntryStats(fileSizeOnDiskAt(loading.root_dir, entry.name, model.io));
+            loading.processed_bytes += stats.size;
+            try model.finalizeLoadingEntry(idx, stats, false);
             return true;
         }
 
-        switch (openChildDirForScan(loading.root_dir, model.io, entry.name, model.cache_ttl_seconds) orelse {
-            try model.finalizeLoadingEntry(idx, 0, false);
+        switch (openChildDirForScan(loading.root_dir, model.io, entry.name, model.cache_ttl_seconds, true) orelse {
+            try model.finalizeLoadingEntry(idx, .{}, false);
             return true;
         }) {
-            .cached_size => |cached_size| {
-                loading.processed_bytes += cached_size;
+            .cached_stats => |cached_stats| {
+                loading.processed_bytes += cached_stats.size;
                 loading.processed_dirs += 1;
-                try model.finalizeLoadingEntry(idx, cached_size, true);
+                try model.finalizeLoadingEntry(idx, cached_stats, true);
                 return true;
             },
             .dir => |dir| {
@@ -523,14 +584,16 @@ pub const Model = struct {
         }
     }
 
-    fn finalizeLoadingEntry(model: *Model, entry_index: usize, size: u64, cache_written: bool) !void {
+    fn finalizeLoadingEntry(model: *Model, entry_index: usize, stats: DirStats, cache_written: bool) !void {
         const loading = &model.loading.?;
         if (entry_index < model.entries.len) {
-            model.entries[entry_index].size = size;
+            model.entries[entry_index].size = stats.size;
+            model.entries[entry_index].file_count = stats.file_count;
+            model.entries[entry_index].dir_count = stats.dir_count;
             if (!cache_written and model.entries[entry_index].is_dir and model.entries[entry_index].role == .item) {
                 const full_path = try model.allocEntryPath(model.entries[entry_index]);
                 defer model.allocator.free(full_path);
-                writeCachedDirSize(full_path, size, model.cache_ttl_seconds, model.allocator);
+                writeCachedDirStats(full_path, stats, model.cache_ttl_seconds, model.allocator);
             }
         }
         loading.processed += 1;
@@ -538,18 +601,18 @@ pub const Model = struct {
     }
 
     fn prependRootSummaryToEntries(model: *Model) !void {
-        const total_size = totalItemSize(model.entries);
+        const total_stats = currentDirStatsFromEntries(model.entries);
 
         const updated = try model.allocator.alloc(Entry, model.entries.len + 1);
         errdefer model.allocator.free(updated);
-        updated[0] = try allocEntryOwned(model.allocator, "", model.cwd, total_size, true, .summary);
+        updated[0] = try allocEntryOwned(model.allocator, "", model.cwd, total_stats, true, .summary);
         @memcpy(updated[1..], model.entries);
         model.allocator.free(model.entries);
         model.entries = updated;
         if (model.loading) |loading| {
-            writeCachedDirSizeFd(loading.root_dir, total_size, model.cache_ttl_seconds);
+            writeCachedDirStatsFd(loading.root_dir, total_stats, model.cache_ttl_seconds);
         } else {
-            writeCachedDirSize(model.cwd, total_size, model.cache_ttl_seconds, model.allocator);
+            writeCachedDirStats(model.cwd, total_stats, model.cache_ttl_seconds, model.allocator);
         }
     }
 
@@ -574,9 +637,9 @@ pub const Model = struct {
     }
 
     fn prependRootSummary(allocator: mem.Allocator, entries: *std.ArrayList(Entry), cwd: []const u8) !void {
-        const total_size = totalItemSize(entries.items);
+        const total_stats = currentDirStatsFromEntries(entries.items);
 
-        try entries.insert(allocator, 0, try allocEntryOwned(allocator, "", cwd, total_size, true, .summary));
+        try entries.insert(allocator, 0, try allocEntryOwned(allocator, "", cwd, total_stats, true, .summary));
     }
 
     fn ensureSelectionVisible(model: *Model, visible_rows: usize) void {
@@ -605,57 +668,67 @@ pub const Model = struct {
     const StackFrame = struct {
         dir: std.Io.Dir,
         iter: std.Io.Dir.Iterator,
-        total: u64 = 0,
+        total: DirStats = .{ .dir_count = 1 },
     };
 
     fn computeDirStats(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) DirStats {
-        if (zdu.isGeneratedDirPath(path)) return .{ .size = 0, .dir_count = 0 };
-
-        if (cache_ttl_seconds > 0) {
-            if (readCachedDirSize(path, allocator)) |cached_size| {
-                return .{ .size = cached_size, .dir_count = 1 };
-            }
-        }
-
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return .{ .size = 0, .dir_count = 1 };
-        defer dir.close(io);
-
-        return computeDirStatsInDir(dir, io, cache_ttl_seconds);
+        return computeDirStatsWithCache(path, allocator, io, cache_ttl_seconds, true);
     }
 
-    fn computeDirStatsInDir(dir: std.Io.Dir, io: std.Io, cache_ttl_seconds: u64) DirStats {
-        if (cache_ttl_seconds > 0) {
-            if (readCachedDirSizeFd(dir)) |cached_size| {
-                return .{ .size = cached_size, .dir_count = 1 };
+    fn computeDirStatsRefreshing(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) DirStats {
+        return computeDirStatsWithCache(path, allocator, io, cache_ttl_seconds, false);
+    }
+
+    fn computeDirStatsWithCache(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64, read_cache: bool) DirStats {
+        if (zdu.isGeneratedDirPath(path)) return .{};
+
+        if (read_cache and cache_ttl_seconds > 0) {
+            if (readCachedDirStats(path, allocator)) |cached_stats| {
+                return cached_stats;
             }
         }
 
-        var total: u64 = 0;
-        var dir_count: u64 = 1;
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return .{ .dir_count = 1 };
+        defer dir.close(io);
+
+        return computeDirStatsInDir(dir, io, cache_ttl_seconds, read_cache);
+    }
+
+    fn computeDirStatsInDir(dir: std.Io.Dir, io: std.Io, cache_ttl_seconds: u64, read_cache: bool) DirStats {
+        if (read_cache and cache_ttl_seconds > 0) {
+            if (readCachedDirStatsFd(dir)) |cached_stats| {
+                return cached_stats;
+            }
+        }
+
+        var total: DirStats = .{ .dir_count = 1 };
         var iter = dir.iterateAssumeFirstIteration();
         while (iter.next(io) catch null) |entry| {
             if (entry.kind == .file) {
-                total += fileSizeOnDiskAt(dir, entry.name, io);
+                addStats(&total, fileEntryStats(fileSizeOnDiskAt(dir, entry.name, io)));
             } else if (entry.kind == .directory) {
-                switch (openChildDirForScan(dir, io, entry.name, cache_ttl_seconds) orelse continue) {
-                    .cached_size => |cached_size| {
-                        total += cached_size;
-                        dir_count += 1;
-                    },
+                switch (openChildDirForScan(dir, io, entry.name, cache_ttl_seconds, read_cache) orelse continue) {
+                    .cached_stats => |cached_stats| addStats(&total, cached_stats),
                     .dir => |subdir| {
                         defer subdir.close(io);
-                        const child = computeDirStatsInDir(subdir, io, cache_ttl_seconds);
-                        total += child.size;
-                        dir_count += child.dir_count;
+                        addStats(&total, computeDirStatsInDir(subdir, io, cache_ttl_seconds, read_cache));
                     },
                 }
             }
         }
-        writeCachedDirSizeFd(dir, total, cache_ttl_seconds);
-        return .{ .size = total, .dir_count = dir_count };
+        writeCachedDirStatsFd(dir, total, cache_ttl_seconds);
+        return total;
     }
 
     fn computeDirStatsStack(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) !DirStats {
+        return computeDirStatsStackWithCache(path, allocator, io, cache_ttl_seconds, true);
+    }
+
+    fn computeDirStatsStackRefreshing(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) !DirStats {
+        return computeDirStatsStackWithCache(path, allocator, io, cache_ttl_seconds, false);
+    }
+
+    fn computeDirStatsStackWithCache(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64, read_cache: bool) !DirStats {
         var stack: std.ArrayList(StackFrame) = .empty;
         defer {
             for (stack.items) |*frame| {
@@ -664,34 +737,30 @@ pub const Model = struct {
             stack.deinit(allocator);
         }
 
-        var root_dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return .{ .size = 0, .dir_count = 1 };
-        if (cache_ttl_seconds > 0) {
-            if (readCachedDirSizeFd(root_dir)) |cached_size| {
+        var root_dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return .{ .dir_count = 1 };
+        if (read_cache and cache_ttl_seconds > 0) {
+            if (readCachedDirStatsFd(root_dir)) |cached_stats| {
                 root_dir.close(io);
-                return .{ .size = cached_size, .dir_count = 1 };
+                return cached_stats;
             }
         }
         try pushDirStatsFrame(&stack, allocator, io, root_dir);
-
-        var dir_count: u64 = 1;
 
         while (stack.items.len > 0) {
             var frame = &stack.items[stack.items.len - 1];
             if (frame.iter.next(io) catch null) |entry| {
                 if (entry.kind == .file) {
-                    frame.total += fileSizeOnDiskAt(frame.dir, entry.name, io);
+                    addStats(&frame.total, fileEntryStats(fileSizeOnDiskAt(frame.dir, entry.name, io)));
                     continue;
                 }
                 if (entry.kind == .directory) {
-                    switch (openChildDirForScan(frame.dir, io, entry.name, cache_ttl_seconds) orelse continue) {
-                        .cached_size => |cached_size| {
-                            frame.total += cached_size;
-                            dir_count += 1;
+                    switch (openChildDirForScan(frame.dir, io, entry.name, cache_ttl_seconds, read_cache) orelse continue) {
+                        .cached_stats => |cached_stats| {
+                            addStats(&frame.total, cached_stats);
                             continue;
                         },
                         .dir => |subdir| {
                             try pushDirStatsFrame(&stack, allocator, io, subdir);
-                            dir_count += 1;
                             continue;
                         },
                     }
@@ -700,17 +769,17 @@ pub const Model = struct {
             }
 
             const completed = stack.pop().?;
-            writeCachedDirSizeFd(completed.dir, completed.total, cache_ttl_seconds);
+            writeCachedDirStatsFd(completed.dir, completed.total, cache_ttl_seconds);
             completed.dir.close(io);
 
             if (stack.items.len > 0) {
-                stack.items[stack.items.len - 1].total += completed.total;
+                addStats(&stack.items[stack.items.len - 1].total, completed.total);
             } else {
-                return .{ .size = completed.total, .dir_count = dir_count };
+                return completed.total;
             }
         }
 
-        return .{ .size = 0, .dir_count = dir_count };
+        return .{};
     }
 
     fn fileSizeOnDisk(path: []const u8, allocator: mem.Allocator, io: std.Io) u64 {
@@ -757,34 +826,127 @@ pub const Model = struct {
     }
 
     fn readCachedDirSize(path: []const u8, allocator: mem.Allocator) ?u64 {
+        if (readCachedDirStats(path, allocator)) |stats| return stats.size;
+        return null;
+    }
+
+    fn readCachedDirSizeFd(dir: std.Io.Dir) ?u64 {
+        if (readCachedDirStatsFd(dir)) |stats| return stats.size;
+        return null;
+    }
+
+    fn readCachedDirStats(path: []const u8, allocator: mem.Allocator) ?DirStats {
         const now = currentTimestampSeconds() orelse return null;
         const path_z = allocator.dupeZ(u8, path) catch return null;
         defer allocator.free(path_z);
+        var buf: [32]u8 = undefined;
+
+        switch (builtin.os.tag) {
+            .linux => {
+                const linux = std.os.linux;
+                const rc = linux.getxattr(path_z.ptr, dir_stats_xattr_name, buf[0..].ptr, buf.len);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc != buf.len) return null;
+                        const record = decodeCachedDirStats(&buf);
+                        if (record.expires_at < now) return null;
+                        return .{
+                            .size = record.size,
+                            .file_count = record.file_count,
+                            .dir_count = record.dir_count,
+                        };
+                    },
+                    else => return readCachedDirStatsV2Z(path_z.ptr, now),
+                }
+            },
+            .macos => {
+                const rc = darwin_xattr.getxattr(path_z.ptr, dir_stats_xattr_name, buf[0..].ptr, buf.len, 0, 0);
+                switch (std.c.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc != buf.len) return null;
+                        const record = decodeCachedDirStats(&buf);
+                        if (record.expires_at < now) return null;
+                        return .{
+                            .size = record.size,
+                            .file_count = record.file_count,
+                            .dir_count = record.dir_count,
+                        };
+                    },
+                    else => return readCachedDirStatsV2Z(path_z.ptr, now),
+                }
+            },
+            else => return null,
+        }
+    }
+
+    fn readCachedDirStatsFd(dir: std.Io.Dir) ?DirStats {
+        const now = currentTimestampSeconds() orelse return null;
+        var buf: [32]u8 = undefined;
+
+        switch (builtin.os.tag) {
+            .linux => {
+                const linux = std.os.linux;
+                const rc = linux.fgetxattr(dir.handle, dir_stats_xattr_name, buf[0..].ptr, buf.len);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc != buf.len) return null;
+                        const record = decodeCachedDirStats(&buf);
+                        if (record.expires_at < now) return null;
+                        return .{
+                            .size = record.size,
+                            .file_count = record.file_count,
+                            .dir_count = record.dir_count,
+                        };
+                    },
+                    else => return readCachedDirStatsV2Fd(dir, now),
+                }
+            },
+            .macos => {
+                const rc = darwin_xattr.fgetxattr(dir.handle, dir_stats_xattr_name, buf[0..].ptr, buf.len, 0, 0);
+                switch (std.c.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc != buf.len) return null;
+                        const record = decodeCachedDirStats(&buf);
+                        if (record.expires_at < now) return null;
+                        return .{
+                            .size = record.size,
+                            .file_count = record.file_count,
+                            .dir_count = record.dir_count,
+                        };
+                    },
+                    else => return readCachedDirStatsV2Fd(dir, now),
+                }
+            },
+            else => return null,
+        }
+    }
+
+    fn readCachedDirStatsV2Z(path_z: [*:0]const u8, now: u64) ?DirStats {
         var buf: [16]u8 = undefined;
 
         switch (builtin.os.tag) {
             .linux => {
                 const linux = std.os.linux;
-                const rc = linux.getxattr(path_z.ptr, dir_size_xattr_name, buf[0..].ptr, buf.len);
+                const rc = linux.getxattr(path_z, dir_size_xattr_name, buf[0..].ptr, buf.len);
                 switch (linux.errno(rc)) {
                     .SUCCESS => {
                         if (rc != buf.len) return null;
                         const record = decodeCachedDirSize(&buf);
                         if (record.expires_at < now) return null;
-                        return record.size;
+                        return .{ .size = record.size };
                     },
                     .NODATA, .NOENT, .OPNOTSUPP, .RANGE => return null,
                     else => return null,
                 }
             },
             .macos => {
-                const rc = darwin_xattr.getxattr(path_z.ptr, dir_size_xattr_name, buf[0..].ptr, buf.len, 0, 0);
+                const rc = darwin_xattr.getxattr(path_z, dir_size_xattr_name, buf[0..].ptr, buf.len, 0, 0);
                 switch (std.c.errno(rc)) {
                     .SUCCESS => {
                         if (rc != buf.len) return null;
                         const record = decodeCachedDirSize(&buf);
                         if (record.expires_at < now) return null;
-                        return record.size;
+                        return .{ .size = record.size };
                     },
                     .NOATTR, .NOENT, .OPNOTSUPP, .RANGE => return null,
                     else => return null,
@@ -794,8 +956,7 @@ pub const Model = struct {
         }
     }
 
-    fn readCachedDirSizeFd(dir: std.Io.Dir) ?u64 {
-        const now = currentTimestampSeconds() orelse return null;
+    fn readCachedDirStatsV2Fd(dir: std.Io.Dir, now: u64) ?DirStats {
         var buf: [16]u8 = undefined;
 
         switch (builtin.os.tag) {
@@ -807,7 +968,7 @@ pub const Model = struct {
                         if (rc != buf.len) return null;
                         const record = decodeCachedDirSize(&buf);
                         if (record.expires_at < now) return null;
-                        return record.size;
+                        return .{ .size = record.size };
                     },
                     .NODATA, .NOENT, .OPNOTSUPP, .RANGE => return null,
                     else => return null,
@@ -820,7 +981,7 @@ pub const Model = struct {
                         if (rc != buf.len) return null;
                         const record = decodeCachedDirSize(&buf);
                         if (record.expires_at < now) return null;
-                        return record.size;
+                        return .{ .size = record.size };
                     },
                     .NOATTR, .NOENT, .OPNOTSUPP, .RANGE => return null,
                     else => return null,
@@ -831,32 +992,46 @@ pub const Model = struct {
     }
 
     fn writeCachedDirSize(path: []const u8, size: u64, cache_ttl_seconds: u64, allocator: mem.Allocator) void {
+        writeCachedDirStats(path, .{ .size = size }, cache_ttl_seconds, allocator);
+    }
+
+    fn writeCachedDirSizeFd(dir: std.Io.Dir, size: u64, cache_ttl_seconds: u64) void {
+        writeCachedDirStatsFd(dir, .{ .size = size }, cache_ttl_seconds);
+    }
+
+    fn writeCachedDirStats(path: []const u8, stats: DirStats, cache_ttl_seconds: u64, allocator: mem.Allocator) void {
         const path_z = allocator.dupeZ(u8, path) catch return;
         defer allocator.free(path_z);
-        const buf = encodeCachedDirSizeForWrite(size, cache_ttl_seconds) orelse return;
+        const stats_buf = encodeCachedDirStatsForWrite(stats, cache_ttl_seconds) orelse return;
+        const size_buf = encodeCachedDirSizeForWrite(stats.size, cache_ttl_seconds) orelse return;
 
         switch (builtin.os.tag) {
             .linux => {
                 const linux = std.os.linux;
-                _ = linux.setxattr(path_z.ptr, dir_size_xattr_name, buf[0..].ptr, buf.len, 0);
+                _ = linux.setxattr(path_z.ptr, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0);
+                _ = linux.setxattr(path_z.ptr, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0);
             },
             .macos => {
-                _ = darwin_xattr.setxattr(path_z.ptr, dir_size_xattr_name, buf[0..].ptr, buf.len, 0, 0);
+                _ = darwin_xattr.setxattr(path_z.ptr, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0, 0);
+                _ = darwin_xattr.setxattr(path_z.ptr, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0, 0);
             },
             else => {},
         }
     }
 
-    fn writeCachedDirSizeFd(dir: std.Io.Dir, size: u64, cache_ttl_seconds: u64) void {
-        const buf = encodeCachedDirSizeForWrite(size, cache_ttl_seconds) orelse return;
+    fn writeCachedDirStatsFd(dir: std.Io.Dir, stats: DirStats, cache_ttl_seconds: u64) void {
+        const stats_buf = encodeCachedDirStatsForWrite(stats, cache_ttl_seconds) orelse return;
+        const size_buf = encodeCachedDirSizeForWrite(stats.size, cache_ttl_seconds) orelse return;
 
         switch (builtin.os.tag) {
             .linux => {
                 const linux = std.os.linux;
-                _ = linux.fsetxattr(dir.handle, dir_size_xattr_name, buf[0..].ptr, buf.len, 0);
+                _ = linux.fsetxattr(dir.handle, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0);
+                _ = linux.fsetxattr(dir.handle, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0);
             },
             .macos => {
-                _ = darwin_xattr.fsetxattr(dir.handle, dir_size_xattr_name, buf[0..].ptr, buf.len, 0, 0);
+                _ = darwin_xattr.fsetxattr(dir.handle, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0, 0);
+                _ = darwin_xattr.fsetxattr(dir.handle, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0, 0);
             },
             else => {},
         }
@@ -884,17 +1059,31 @@ pub const Model = struct {
         }
     }
 
-    fn encodeCachedDirSizeForWrite(size: u64, cache_ttl_seconds: u64) ?[16]u8 {
-        var buf: [16]u8 = undefined;
-        const expires_at: u64 = if (cache_ttl_seconds == 0)
+    fn cacheExpiresAt(cache_ttl_seconds: u64) ?u64 {
+        return if (cache_ttl_seconds == 0)
             std.math.maxInt(u64)
         else blk: {
             const now = currentTimestampSeconds() orelse return null;
             break :blk now + cache_ttl_seconds;
         };
+    }
+
+    fn encodeCachedDirSizeForWrite(size: u64, cache_ttl_seconds: u64) ?[16]u8 {
+        var buf: [16]u8 = undefined;
         encodeCachedDirSize(&buf, .{
             .size = size,
-            .expires_at = expires_at,
+            .expires_at = cacheExpiresAt(cache_ttl_seconds) orelse return null,
+        });
+        return buf;
+    }
+
+    fn encodeCachedDirStatsForWrite(stats: DirStats, cache_ttl_seconds: u64) ?[32]u8 {
+        var buf: [32]u8 = undefined;
+        encodeCachedDirStats(&buf, .{
+            .size = stats.size,
+            .file_count = stats.file_count,
+            .dir_count = stats.dir_count,
+            .expires_at = cacheExpiresAt(cache_ttl_seconds) orelse return null,
         });
         return buf;
     }
@@ -911,6 +1100,22 @@ pub const Model = struct {
         };
     }
 
+    fn encodeCachedDirStats(buf: *[32]u8, record: CachedDirStats) void {
+        std.mem.writeInt(u64, buf[0..8], record.size, .little);
+        std.mem.writeInt(u64, buf[8..16], record.file_count, .little);
+        std.mem.writeInt(u64, buf[16..24], record.dir_count, .little);
+        std.mem.writeInt(u64, buf[24..32], record.expires_at, .little);
+    }
+
+    fn decodeCachedDirStats(buf: *const [32]u8) CachedDirStats {
+        return .{
+            .size = std.mem.readInt(u64, buf[0..8], .little),
+            .file_count = std.mem.readInt(u64, buf[8..16], .little),
+            .dir_count = std.mem.readInt(u64, buf[16..24], .little),
+            .expires_at = std.mem.readInt(u64, buf[24..32], .little),
+        };
+    }
+
     fn clearCachedDirSize(path: []const u8, allocator: mem.Allocator) void {
         const path_z = allocator.dupeZ(u8, path) catch return;
         defer allocator.free(path_z);
@@ -918,50 +1123,115 @@ pub const Model = struct {
         switch (builtin.os.tag) {
             .linux => {
                 const linux = std.os.linux;
+                _ = linux.removexattr(path_z.ptr, dir_stats_xattr_name);
                 _ = linux.removexattr(path_z.ptr, dir_size_xattr_name);
             },
             .macos => {
+                _ = darwin_xattr.removexattr(path_z.ptr, dir_stats_xattr_name, 0);
                 _ = darwin_xattr.removexattr(path_z.ptr, dir_size_xattr_name, 0);
             },
             else => {},
         }
     }
 
-    fn clearDirSizeCacheChain(model: *Model) void {
+    fn clearCachedDirStats(path: []const u8, allocator: mem.Allocator) void {
+        clearCachedDirSize(path, allocator);
+    }
+
+    fn knownDirStats(model: *Model) ?DirStats {
+        if (model.entries.len > 0 and model.entries[0].role == .summary) {
+            return statsFromEntry(model.entries[0]);
+        }
+        return readCachedDirStats(model.cwd, model.allocator);
+    }
+
+    fn updateEntryStats(entry: *Entry, stats: DirStats) void {
+        entry.size = stats.size;
+        entry.file_count = stats.file_count;
+        entry.dir_count = stats.dir_count;
+    }
+
+    fn updateParentEntryStats(model: *Model, stats: DirStats) void {
+        for (model.entries) |*entry| {
+            if (entry.role == .parent) {
+                updateEntryStats(entry, stats);
+                return;
+            }
+        }
+    }
+
+    fn updateSummaryEntryStats(model: *Model, stats: DirStats) void {
+        if (model.entries.len > 0 and model.entries[0].role == .summary) {
+            updateEntryStats(&model.entries[0], stats);
+        }
+    }
+
+    fn entryPathMatches(model: *Model, entry: Entry, target_path: []const u8) bool {
+        if (entry.path) |path| return mem.eql(u8, path, target_path);
+        const path = allocItemPath(model.allocator, model.cwd, entry.name) catch return false;
+        defer model.allocator.free(path);
+        return mem.eql(u8, path, target_path);
+    }
+
+    fn subtractEntryStatsByPath(model: *Model, target_path: []const u8, deleted_stats: DirStats) void {
+        for (model.entries) |*entry| {
+            if (entry.role != .item) continue;
+            if (!entryPathMatches(model, entry.*, target_path)) continue;
+            if (subtractStats(statsFromEntry(entry.*), deleted_stats)) |updated_stats| {
+                updateEntryStats(entry, updated_stats);
+            }
+            return;
+        }
+    }
+
+    fn propagateDeletedStats(model: *Model, deleted_stats: DirStats, deleted_path: []const u8) void {
         var current: ?*Model = model;
+        var changed_path: []const u8 = deleted_path;
+        var child: ?*Model = null;
+
         while (current) |cursor| {
-            clearCachedDirSize(cursor.cwd, cursor.allocator);
+            const maybe_current_stats = knownDirStats(cursor);
+            if (child != null) subtractEntryStatsByPath(cursor, changed_path, deleted_stats);
+
+            if (maybe_current_stats) |current_stats| {
+                if (subtractStats(current_stats, deleted_stats)) |updated_stats| {
+                    updateSummaryEntryStats(cursor, updated_stats);
+                    writeCachedDirStats(cursor.cwd, updated_stats, cursor.cache_ttl_seconds, cursor.allocator);
+                    if (child) |child_model| child_model.updateParentEntryStats(updated_stats);
+                }
+            }
+
+            changed_path = cursor.cwd;
+            child = cursor;
             current = cursor.parent;
         }
     }
 
-    fn propagateDeletedSize(model: *Model, deleted_size: u64) void {
-        var current: ?*Model = model;
-        while (current) |cursor| {
-            const current_size = blk: {
-                if (cursor.entries.len > 0) {
-                    if (cursor.entries[0].role == .summary) break :blk cursor.entries[0].size;
-                    var total: u64 = 0;
-                    for (cursor.entries) |entry| {
-                        if (entry.role == .item) total += entry.size;
-                    }
-                    break :blk total;
-                }
-                if (readCachedDirSize(cursor.cwd, cursor.allocator)) |cached_size| break :blk cached_size;
-                break :blk computeDirSize(
-                    cursor.cwd,
-                    cursor.allocator,
-                    cursor.io,
-                    cursor.cache_ttl_seconds,
-                );
-            };
-            const updated_size = current_size -| deleted_size;
-            if (cursor.entries.len > 0 and cursor.entries[0].role == .summary) {
-                cursor.entries[0].size = updated_size;
-            }
-            writeCachedDirSize(cursor.cwd, updated_size, cursor.cache_ttl_seconds, cursor.allocator);
-            current = cursor.parent;
+    fn freeEntryItem(allocator: mem.Allocator, entry: Entry) void {
+        allocator.free(entry.name);
+        if (entry.path) |path| allocator.free(path);
+    }
+
+    fn removeEntryAt(model: *Model, entry_index: usize) !void {
+        if (entry_index >= model.entries.len) return;
+        const old_entries = model.entries;
+        if (old_entries[entry_index].role != .item) return;
+
+        const updated = try model.allocator.alloc(Entry, old_entries.len - 1);
+        errdefer model.allocator.free(updated);
+
+        if (entry_index > 0) {
+            @memcpy(updated[0..entry_index], old_entries[0..entry_index]);
         }
+        if (entry_index + 1 < old_entries.len) {
+            @memcpy(updated[entry_index..], old_entries[entry_index + 1 ..]);
+        }
+
+        freeEntryItem(model.allocator, old_entries[entry_index]);
+        model.allocator.free(old_entries);
+        model.entries = updated;
+        if (model.selected >= model.entries.len and model.entries.len > 0) model.selected = model.entries.len - 1;
+        model.resetEntryView();
     }
 
     fn entryIndexForMouseRow(model: *Model, mouse_row: i16) ?usize {
@@ -1040,7 +1310,8 @@ pub const Model = struct {
         model.confirm_delete = .{
             .path = try model.allocEntryPath(entry),
             .is_dir = entry.is_dir,
-            .size = entry.size,
+            .stats = statsFromEntry(entry),
+            .entry_index = model.selected,
         };
     }
 
@@ -1056,8 +1327,8 @@ pub const Model = struct {
             } else {
                 cwd.deleteFile(model.io, confirm.path) catch return;
             }
-            model.propagateDeletedSize(confirm.size);
-            model.loadDir() catch return;
+            model.propagateDeletedStats(confirm.stats, confirm.path);
+            model.removeEntryAt(confirm.entry_index) catch return;
         }
     }
 
@@ -1121,13 +1392,22 @@ pub const Model = struct {
                 }
 
                 if (model.confirm_delete != null) {
+                    if (key.text) |text| {
+                        if (mem.eql(u8, text, "Y")) {
+                            model.confirmDelete() catch {};
+                            if (model.loading != null) try ctx.tick(loading_tick_ms, model.widget());
+                            ctx.redraw = true;
+                            return;
+                        }
+                        if (mem.eql(u8, text, "n")) {
+                            model.cancelDelete();
+                            ctx.redraw = true;
+                            return;
+                        }
+                    }
                     if (key.codepoint == vaxis.Key.enter) {
                         model.confirmDelete() catch {};
                         if (model.loading != null) try ctx.tick(loading_tick_ms, model.widget());
-                        ctx.redraw = true;
-                        return;
-                    } else if (key.text != null and mem.eql(u8, key.text.?, "n")) {
-                        model.cancelDelete();
                         ctx.redraw = true;
                         return;
                     }
@@ -1328,10 +1608,13 @@ pub const Model = struct {
             };
             var size_buf: [32]u8 = undefined;
             const size_str = formatSize(&size_buf, entry.size);
-            const line = if (entry.name.len == 0)
-                try std.fmt.allocPrint(ctx.arena, "{s} {s:>10}", .{ prefix, size_str })
-            else
-                try std.fmt.allocPrint(ctx.arena, "{s} {s:>10} {s}", .{ prefix, size_str, entry.name });
+            const line = if (entry.is_dir) blk: {
+                const file_label = if (entry.file_count == 1) "file" else "files";
+                if (entry.name.len == 0) {
+                    break :blk try std.fmt.allocPrint(ctx.arena, "{s} {s:>10} {d:>8} {s}", .{ prefix, size_str, entry.file_count, file_label });
+                }
+                break :blk try std.fmt.allocPrint(ctx.arena, "{s} {s:>10} {d:>8} {s} {s}", .{ prefix, size_str, entry.file_count, file_label, entry.name });
+            } else try std.fmt.allocPrint(ctx.arena, "{s} {s:>10} {s}", .{ prefix, size_str, entry.name });
 
             const row = @as(u16, @intCast(2 + i));
             const is_selected = entry_idx == model.selected and isSelectableEntry(entry);
@@ -1344,10 +1627,16 @@ pub const Model = struct {
         try writeText(&surface, ctx.arena, help, height -| 1, 0, .{ .fg = .{ .index = 8 } });
 
         if (model.confirm_delete) |confirm| {
-            const dialog_text = try std.fmt.allocPrint(ctx.arena, "Delete {s}? [Y/n]", .{confirm.path});
+            const prefix_text = try std.fmt.allocPrint(ctx.arena, "Delete {s}? [", .{confirm.path});
+            const suffix_text = "/n]";
+            const dialog_len = prefix_text.len + 1 + suffix_text.len;
             const dialog_row = height / 2 -| 1;
-            const dialog_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(dialog_text.len)))) / 2));
-            try writeText(&surface, ctx.arena, dialog_text, dialog_row, dialog_col, .{ .bg = .{ .index = 1 }, .fg = .{ .index = 15 } });
+            const dialog_col = @as(u16, @intCast((width -| @min(width, @as(u16, @intCast(dialog_len)))) / 2));
+            const dialog_style: vaxis.Style = .{ .bg = .{ .index = 1 }, .fg = .{ .index = 15 } };
+            const confirm_style: vaxis.Style = .{ .bg = .{ .index = 15 }, .fg = .{ .index = 1 }, .bold = true };
+            try writeText(&surface, ctx.arena, prefix_text, dialog_row, dialog_col, dialog_style);
+            try writeText(&surface, ctx.arena, "Y", dialog_row, dialog_col + @as(u16, @intCast(prefix_text.len)), confirm_style);
+            try writeText(&surface, ctx.arena, suffix_text, dialog_row, dialog_col + @as(u16, @intCast(prefix_text.len + 1)), dialog_style);
         }
 
         return surface;
@@ -1657,7 +1946,12 @@ test "down key on an empty list does not underflow" {
     try std.testing.expect(ctx.redraw);
 }
 
-test "delete propagates removed size up the directory chain" {
+test "delete walks parent chain and updates cached stats without a rescan" {
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return error.SkipZigTest,
+    }
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1691,13 +1985,156 @@ test "delete propagates removed size up the directory chain" {
     model.selected = findEntryIndex(model, "child.bin") orelse return error.SkipZigTest;
     try model.deleteSelected();
     try model.confirmDelete();
-    try finishLoading(model, std.testing.allocator, std.testing.io);
 
     const remaining_size = Model.fileSizeOnDisk(root_file_path, std.testing.allocator, std.testing.io);
-    try std.testing.expectEqual(@as(?u64, 0), Model.readCachedDirSize(child_path, std.testing.allocator));
-    try std.testing.expectEqual(@as(?u64, remaining_size), Model.readCachedDirSize(root_path, std.testing.allocator));
+    const child_stats = try zduTestRequireCachedStats(child_path, std.testing.allocator);
+    const root_stats = try zduTestRequireCachedStats(root_path, std.testing.allocator);
+
+    try std.testing.expect(findEntryIndex(model, "child.bin") == null);
+    try std.testing.expectEqual(@as(u64, 0), child_stats.size);
+    try std.testing.expectEqual(@as(u64, 0), child_stats.file_count);
+    try std.testing.expectEqual(@as(u64, 1), child_stats.dir_count);
+    try std.testing.expectEqual(remaining_size, root_stats.size);
+    try std.testing.expectEqual(@as(u64, 1), root_stats.file_count);
+    try std.testing.expectEqual(@as(u64, 2), root_stats.dir_count);
     try std.testing.expectEqualStrings("..", model.entries[0].name);
     try std.testing.expectEqual(remaining_size, model.entries[0].size);
+    try std.testing.expectEqual(@as(u64, 1), model.entries[0].file_count);
+}
+
+
+
+test "uppercase Y confirms delete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try zduTestWriteFile(&tmp, "victim.txt", "delete me");
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root_path);
+
+    const victim_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "victim.txt" });
+    defer std.testing.allocator.free(victim_path);
+
+    const model = try Model.init(std.testing.io, std.testing.allocator, root_path);
+    defer model.deinit();
+
+    model.selected = findEntryIndex(model, "victim.txt") orelse return error.SkipZigTest;
+    try model.deleteSelected();
+    try std.testing.expect(model.confirm_delete != null);
+
+    var ctx = testEventContext(std.testing.allocator, std.testing.io);
+    defer ctx.cmds.deinit(std.testing.allocator);
+
+    try model.handleEvent(&ctx, .{ .key_press = .{ .codepoint = 'Y', .text = "Y" } });
+
+    try std.testing.expect(model.confirm_delete == null);
+    try std.testing.expect(ctx.redraw);
+    try std.testing.expect(findEntryIndex(model, "victim.txt") == null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, victim_path, .{}));
+}
+
+test "delete propagation skips missing cache instead of recomputing" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root_path);
+
+    Model.clearCachedDirStats(root_path, std.testing.allocator);
+
+    var model: Model = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .cwd = root_path,
+    };
+
+    model.propagateDeletedStats(.{ .size = 1, .file_count = 1 }, root_path);
+    try std.testing.expect(Model.readCachedDirStats(root_path, std.testing.allocator) == null);
+}
+
+test "delete propagation skips stale undersized cache" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root_path);
+
+    Model.writeCachedDirStats(root_path, .{ .size = 1, .file_count = 1, .dir_count = 1 }, 60, std.testing.allocator);
+
+    var model: Model = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .cwd = root_path,
+        .cache_ttl_seconds = 60,
+    };
+
+    model.propagateDeletedStats(.{ .size = 2, .file_count = 1 }, root_path);
+
+    const cached = try zduTestRequireCachedStats(root_path, std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), cached.size);
+    try std.testing.expectEqual(@as(u64, 1), cached.file_count);
+    try std.testing.expectEqual(@as(u64, 1), cached.dir_count);
+}
+
+test "delete delta updates cached ancestors by walking the model chain" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sub");
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root_path);
+    const child_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "sub" });
+    defer std.testing.allocator.free(child_path);
+    const deleted_path = try std.fs.path.join(std.testing.allocator, &.{ child_path, "victim.txt" });
+    defer std.testing.allocator.free(deleted_path);
+
+    Model.writeCachedDirStats(root_path, .{ .size = 100, .file_count = 3, .dir_count = 2 }, 60, std.testing.allocator);
+    Model.writeCachedDirStats(child_path, .{ .size = 70, .file_count = 2, .dir_count = 1 }, 60, std.testing.allocator);
+
+    var parent_entries = [_]Model.Entry{
+        .{ .name = @constCast(""), .path = root_path, .size = 100, .file_count = 3, .dir_count = 2, .is_dir = true, .role = .summary },
+        .{ .name = @constCast("sub"), .path = child_path, .size = 70, .file_count = 2, .dir_count = 1, .is_dir = true },
+    };
+    var parent_model: Model = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .cwd = root_path,
+        .entries = parent_entries[0..],
+        .cache_ttl_seconds = 60,
+    };
+
+    var child_entries = [_]Model.Entry{
+        .{ .name = @constCast(".."), .path = root_path, .size = 100, .file_count = 3, .dir_count = 2, .is_dir = true, .role = .parent },
+    };
+    var child_model: Model = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .cwd = child_path,
+        .entries = child_entries[0..],
+        .parent = &parent_model,
+        .cache_ttl_seconds = 60,
+    };
+
+    child_model.propagateDeletedStats(.{ .size = 30, .file_count = 1 }, deleted_path);
+
+    const child_stats = try zduTestRequireCachedStats(child_path, std.testing.allocator);
+    const root_stats = try zduTestRequireCachedStats(root_path, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 40), child_stats.size);
+    try std.testing.expectEqual(@as(u64, 1), child_stats.file_count);
+    try std.testing.expectEqual(@as(u64, 1), child_stats.dir_count);
+    try std.testing.expectEqual(@as(u64, 70), root_stats.size);
+    try std.testing.expectEqual(@as(u64, 2), root_stats.file_count);
+    try std.testing.expectEqual(@as(u64, 2), root_stats.dir_count);
+    try std.testing.expectEqual(@as(u64, 40), parent_entries[1].size);
+    try std.testing.expectEqual(@as(u64, 70), child_entries[0].size);
 }
 
 test "computeDirSize counts allocated bytes for sparse files" {
@@ -1740,31 +2177,167 @@ const RootScanMode = enum {
     stack,
 };
 
-fn scanRootTotal(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64, mode: RootScanMode) !u64 {
-    if (zdu.isGeneratedDirPath(cwd)) return 0;
+const RootScanOptions = struct {
+    cache_ttl_seconds: u64 = 0,
+    refresh_cache: bool = false,
+    parallel: bool = false,
+    num_threads: usize = 0,
+};
 
-    var dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch return 0;
+const ParallelScanTask = struct {
+    path: []u8,
+    estimate_files: u64,
+};
+
+const ParallelScanContext = struct {
+    io: std.Io,
+    allocator: mem.Allocator,
+    cache_ttl_seconds: u64,
+    refresh_cache: bool,
+    tasks: []const ParallelScanTask,
+    results: []Model.DirStats,
+    next_index: usize = 0,
+    mutex: std.Io.Mutex = .init,
+};
+
+fn sortParallelTasks(tasks: []ParallelScanTask) void {
+    mem.sortUnstable(ParallelScanTask, tasks, {}, struct {
+        fn less(_: void, a: ParallelScanTask, b: ParallelScanTask) bool {
+            if (a.estimate_files != b.estimate_files) return a.estimate_files > b.estimate_files;
+            return mem.lessThan(u8, a.path, b.path);
+        }
+    }.less);
+}
+
+fn computeRootTaskStats(io: std.Io, allocator: mem.Allocator, path: []const u8, cache_ttl_seconds: u64, refresh_cache: bool, mode: RootScanMode) !Model.DirStats {
+    return switch (mode) {
+        .worker => if (refresh_cache)
+            Model.computeDirStatsRefreshing(path, allocator, io, cache_ttl_seconds)
+        else
+            Model.computeDirStats(path, allocator, io, cache_ttl_seconds),
+        .stack => if (refresh_cache)
+            try Model.computeDirStatsStackRefreshing(path, allocator, io, cache_ttl_seconds)
+        else
+            try Model.computeDirStatsStack(path, allocator, io, cache_ttl_seconds),
+    };
+}
+
+fn nextParallelTask(ctx: *ParallelScanContext) ?usize {
+    ctx.mutex.lockUncancelable(ctx.io);
+    defer ctx.mutex.unlock(ctx.io);
+
+    if (ctx.next_index >= ctx.tasks.len) return null;
+    const idx = ctx.next_index;
+    ctx.next_index += 1;
+    return idx;
+}
+
+fn parallelScanWorker(ctx: *ParallelScanContext) void {
+    while (nextParallelTask(ctx)) |idx| {
+        ctx.results[idx] = computeRootTaskStats(
+            ctx.io,
+            ctx.allocator,
+            ctx.tasks[idx].path,
+            ctx.cache_ttl_seconds,
+            ctx.refresh_cache,
+            .stack,
+        ) catch .{};
+    }
+}
+
+fn resolvedWorkerCount(parallel: bool, requested: usize, task_count: usize) usize {
+    if (!parallel or task_count <= 1) return 1;
+    const detected = if (requested == 0) std.Thread.getCpuCount() catch 1 else requested;
+    return @max(@as(usize, 1), @min(detected, task_count));
+}
+
+fn scanRootStatsMode(io: std.Io, allocator: mem.Allocator, cwd: []const u8, opts: RootScanOptions, mode: RootScanMode) !Model.DirStats {
+    if (zdu.isGeneratedDirPath(cwd)) return .{};
+
+    var dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch return .{ .dir_count = 1 };
     defer dir.close(io);
 
-    var iter = dir.iterate();
-    var total_size: u64 = 0;
-    while (iter.next(io) catch null) |entry| {
-        const full_path = try std.fs.path.join(allocator, &.{ cwd, entry.name });
-        defer allocator.free(full_path);
+    var tasks: std.ArrayList(ParallelScanTask) = .empty;
+    defer {
+        for (tasks.items) |task| allocator.free(task.path);
+        tasks.deinit(allocator);
+    }
 
+    var root_stats: Model.DirStats = .{ .dir_count = 1 };
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
         if (entry.kind == .directory) {
-            if (zdu.isGeneratedDirPath(full_path)) continue;
-            const stats = switch (mode) {
-                .worker => Model.computeDirStats(full_path, allocator, io, cache_ttl_seconds),
-                .stack => try Model.computeDirStatsStack(full_path, allocator, io, cache_ttl_seconds),
-            };
-            total_size += stats.size;
+            const full_path = try std.fs.path.join(allocator, &.{ cwd, entry.name });
+            errdefer allocator.free(full_path);
+            if (zdu.isGeneratedDirPath(full_path)) {
+                allocator.free(full_path);
+                continue;
+            }
+            const estimate_files = if (Model.readCachedDirStats(full_path, allocator)) |cached_stats| cached_stats.file_count else 0;
+            try tasks.append(allocator, .{
+                .path = full_path,
+                .estimate_files = estimate_files,
+            });
         } else if (entry.kind == .file) {
-            total_size += Model.fileSizeOnDiskAt(dir, entry.name, io);
+            Model.addStats(&root_stats, Model.fileEntryStats(Model.fileSizeOnDiskAt(dir, entry.name, io)));
         }
     }
-    Model.writeCachedDirSize(cwd, total_size, cache_ttl_seconds, allocator);
-    return total_size;
+
+    sortParallelTasks(tasks.items);
+
+    const worker_count = resolvedWorkerCount(opts.parallel and mode == .stack, opts.num_threads, tasks.items.len);
+    if (worker_count > 1) {
+        const results = try allocator.alloc(Model.DirStats, tasks.items.len);
+        defer allocator.free(results);
+        for (results) |*result| result.* = .{};
+
+        var ctx = ParallelScanContext{
+            .io = io,
+            .allocator = allocator,
+            .cache_ttl_seconds = opts.cache_ttl_seconds,
+            .refresh_cache = opts.refresh_cache,
+            .tasks = tasks.items,
+            .results = results,
+        };
+
+        const threads = try allocator.alloc(std.Thread, worker_count);
+        defer allocator.free(threads);
+
+        var spawned: usize = 0;
+        errdefer {
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+        while (spawned < worker_count) : (spawned += 1) {
+            threads[spawned] = try std.Thread.spawn(.{}, parallelScanWorker, .{&ctx});
+        }
+        for (threads[0..spawned]) |thread| thread.join();
+
+        for (results) |stats| Model.addStats(&root_stats, stats);
+    } else {
+        for (tasks.items) |task| {
+            const stats = try computeRootTaskStats(
+                io,
+                allocator,
+                task.path,
+                opts.cache_ttl_seconds,
+                opts.refresh_cache,
+                mode,
+            );
+            Model.addStats(&root_stats, stats);
+        }
+    }
+
+    Model.writeCachedDirStats(cwd, root_stats, opts.cache_ttl_seconds, allocator);
+    return root_stats;
+}
+
+fn scanRootStats(io: std.Io, allocator: mem.Allocator, cwd: []const u8, opts: RootScanOptions) !Model.DirStats {
+    return scanRootStatsMode(io, allocator, cwd, opts, .stack);
+}
+
+fn scanRootTotal(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64, mode: RootScanMode) !u64 {
+    const stats = try scanRootStatsMode(io, allocator, cwd, .{ .cache_ttl_seconds = cache_ttl_seconds }, mode);
+    return stats.size;
 }
 
 fn benchmarkWorkerLoad(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !u64 {
@@ -1788,31 +2361,45 @@ fn runBenchmarks(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_tt
     std.debug.print("worker_thread_ms={d}\nstack_machine_ms={d}\n", .{ worker_ms, stack_ms });
 }
 
-fn runNoTui(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !void {
-    _ = allocator;
-    _ = cache_ttl_seconds;
-    const result = try zdu.scan(io, .{
-        .path = cwd,
-        .format = .human,
-        .summarize = true,
-        .show_hidden = false,
-        .max_depth = null,
-        .max_entries = null,
-        .parallel = false,
-        .num_threads = 1,
-        .use_io_uring = false,
-    });
+fn runNoTui(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64, refresh_cache: bool, parallel: bool, num_threads: usize) !void {
+    const total_size = blk: {
+        if (cache_ttl_seconds > 0 or refresh_cache or parallel) {
+            const stats = try scanRootStats(io, allocator, cwd, .{
+                .cache_ttl_seconds = cache_ttl_seconds,
+                .refresh_cache = refresh_cache,
+                .parallel = parallel,
+                .num_threads = num_threads,
+            });
+            break :blk stats.size;
+        }
+
+        const result = try zdu.scan(io, .{
+            .path = cwd,
+            .format = .human,
+            .summarize = true,
+            .show_hidden = false,
+            .max_depth = null,
+            .max_entries = null,
+            .parallel = parallel,
+            .num_threads = if (num_threads == 0) 1 else num_threads,
+            .use_io_uring = false,
+        });
+        break :blk result.total_size;
+    };
 
     var stdout_buffer: [64]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    try stdout.print("{d}\n", .{result.total_size});
+    try stdout.print("{d}\n", .{total_size});
     try stdout.flush();
 }
 
 const Config = struct {
     cwd: []const u8 = ".",
     cache_ttl_seconds: u64 = 0,
+    refresh_cache: bool = false,
+    parallel: bool = false,
+    num_threads: usize = 0,
     bench: bool = false,
     no_tui: bool = false,
 };
@@ -1833,6 +2420,23 @@ fn parseArgs(args: []const []const u8) !Config {
                 }
             } else {
                 config.cache_ttl_seconds = 60;
+            }
+        } else if (mem.eql(u8, arg, "--refresh-cache")) {
+            config.refresh_cache = true;
+        } else if (mem.eql(u8, arg, "--parallel")) {
+            config.parallel = true;
+        } else if (mem.eql(u8, arg, "--jobs") or mem.eql(u8, arg, "-j")) {
+            config.parallel = true;
+            if (idx + 1 < args.len) {
+                const next_arg = args[idx + 1];
+                if (std.fmt.parseInt(usize, next_arg, 10)) |val| {
+                    config.num_threads = @max(@as(usize, 1), val);
+                    idx += 1;
+                } else |_| {
+                    config.num_threads = 1;
+                }
+            } else {
+                config.num_threads = 1;
             }
         } else if (mem.eql(u8, arg, "--bench")) {
             config.bench = true;
@@ -1858,7 +2462,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (config.no_tui) {
-        try runNoTui(init.io, allocator, config.cwd, config.cache_ttl_seconds);
+        try runNoTui(init.io, allocator, config.cwd, config.cache_ttl_seconds, config.refresh_cache, config.parallel, config.num_threads);
         return;
     }
 
@@ -1898,6 +2502,49 @@ test "parseArgs: full example" {
     try std.testing.expectEqualStrings("/home/user", config.cwd);
 }
 
+
+test "parseArgs: --refresh-cache" {
+    const args = &[_][]const u8{ "zdu", "--no-tui", "--refresh-cache", "--cache-ttl", "1800", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.no_tui);
+    try std.testing.expect(config.refresh_cache);
+    try std.testing.expectEqual(@as(u64, 1800), config.cache_ttl_seconds);
+    try std.testing.expectEqualStrings("/home/user", config.cwd);
+}
+
+test "parseArgs: --parallel and --jobs" {
+    const args = &[_][]const u8{ "zdu", "--no-tui", "--parallel", "--jobs", "8", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.no_tui);
+    try std.testing.expect(config.parallel);
+    try std.testing.expectEqual(@as(usize, 8), config.num_threads);
+    try std.testing.expectEqualStrings("/home/user", config.cwd);
+}
+
+
+test "parseArgs: -j implies parallel" {
+    const args = &[_][]const u8{ "zdu", "--no-tui", "-j", "4", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.no_tui);
+    try std.testing.expect(config.parallel);
+    try std.testing.expectEqual(@as(usize, 4), config.num_threads);
+    try std.testing.expectEqualStrings("/home/user", config.cwd);
+}
+
+test "parallel scan tasks are sorted by cached file count" {
+    var tasks = [_]ParallelScanTask{
+        .{ .path = @constCast("small"), .estimate_files = 1 },
+        .{ .path = @constCast("large"), .estimate_files = 10 },
+        .{ .path = @constCast("middle"), .estimate_files = 5 },
+    };
+
+    sortParallelTasks(tasks[0..]);
+
+    try std.testing.expectEqualStrings("large", tasks[0].path);
+    try std.testing.expectEqualStrings("middle", tasks[1].path);
+    try std.testing.expectEqualStrings("small", tasks[2].path);
+}
+
 fn zduTestTmpPath(
     allocator: mem.Allocator,
     tmp: *std.testing.TmpDir,
@@ -1925,9 +2572,20 @@ fn zduTestRequireCachedSize(path: []const u8, allocator: mem.Allocator) !u64 {
     return Model.readCachedDirSize(path, allocator) orelse error.TestUnexpectedResult;
 }
 
+fn zduTestRequireCachedStats(path: []const u8, allocator: mem.Allocator) !Model.DirStats {
+    return Model.readCachedDirStats(path, allocator) orelse error.TestUnexpectedResult;
+}
+
 fn zduTestEncodeCacheRecord(buf: *[16]u8, size: u64, expires_at: u64) void {
     std.mem.writeInt(u64, buf[0..8], size, .little);
     std.mem.writeInt(u64, buf[8..16], expires_at, .little);
+}
+
+fn zduTestEncodeStatsCacheRecord(buf: *[32]u8, stats: Model.DirStats, expires_at: u64) void {
+    std.mem.writeInt(u64, buf[0..8], stats.size, .little);
+    std.mem.writeInt(u64, buf[8..16], stats.file_count, .little);
+    std.mem.writeInt(u64, buf[16..24], stats.dir_count, .little);
+    std.mem.writeInt(u64, buf[24..32], expires_at, .little);
 }
 
 fn zduTestSetRawDirSizeXattr(
@@ -1935,6 +2593,7 @@ fn zduTestSetRawDirSizeXattr(
     bytes: []const u8,
     allocator: mem.Allocator,
 ) !void {
+    Model.clearCachedDirStats(path, allocator);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
@@ -1953,6 +2612,42 @@ fn zduTestSetRawDirSizeXattr(
             const rc = darwin_xattr.setxattr(
                 path_z.ptr,
                 Model.dir_size_xattr_name,
+                bytes.ptr,
+                bytes.len,
+                0,
+                0,
+            );
+            if (std.c.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+
+fn zduTestSetRawDirStatsXattr(
+    path: []const u8,
+    bytes: []const u8,
+    allocator: mem.Allocator,
+) !void {
+    Model.clearCachedDirStats(path, allocator);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    switch (builtin.os.tag) {
+        .linux => {
+            const rc = std.os.linux.setxattr(
+                path_z.ptr,
+                Model.dir_stats_xattr_name,
+                bytes.ptr,
+                bytes.len,
+                0,
+            );
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        },
+        .macos => {
+            const rc = darwin_xattr.setxattr(
+                path_z.ptr,
+                Model.dir_stats_xattr_name,
                 bytes.ptr,
                 bytes.len,
                 0,
@@ -2010,6 +2705,9 @@ test "loading writes each nested directory cache with that directory's own size"
     const a_cached = try zduTestRequireCachedSize(a_path, allocator);
     const b_cached = try zduTestRequireCachedSize(b_path, allocator);
     const c_cached = try zduTestRequireCachedSize(c_path, allocator);
+    const a_stats = try zduTestRequireCachedStats(a_path, allocator);
+    const b_stats = try zduTestRequireCachedStats(b_path, allocator);
+    const c_stats = try zduTestRequireCachedStats(c_path, allocator);
 
     try std.testing.expect(b_cached > 0);
     try std.testing.expect(c_cached > 0);
@@ -2017,9 +2715,56 @@ test "loading writes each nested directory cache with that directory's own size"
     try std.testing.expect(a_cached > b_cached);
     try std.testing.expect(a_cached > c_cached);
     try std.testing.expectEqual(a_cached, b_cached + c_cached);
+    try std.testing.expectEqual(@as(u64, 2), a_stats.file_count);
+    try std.testing.expectEqual(@as(u64, 3), a_stats.dir_count);
+    try std.testing.expectEqual(@as(u64, 1), b_stats.file_count);
+    try std.testing.expectEqual(@as(u64, 1), b_stats.dir_count);
+    try std.testing.expectEqual(@as(u64, 1), c_stats.file_count);
+    try std.testing.expectEqual(@as(u64, 1), c_stats.dir_count);
 }
 
-test "dir size xattr cache accepts fresh records and rejects expired or malformed records" {
+
+test "scanRootStats refreshes v3 stats cache with file counts" {
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return error.SkipZigTest,
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root/a");
+    try zduTestWriteFile(&tmp, "root/a/one.dat", &[_]u8{ 1 });
+    try zduTestWriteFile(&tmp, "root/a/two.dat", &[_]u8{ 2, 3 });
+
+    const root_path = try zduTestTmpPath(allocator, &tmp, "root");
+    defer allocator.free(root_path);
+    const a_path = try zduTestTmpPath(allocator, &tmp, "root/a");
+    defer allocator.free(a_path);
+
+    Model.clearCachedDirSize(root_path, allocator);
+    Model.clearCachedDirSize(a_path, allocator);
+
+    const stats = try scanRootStats(std.testing.io, allocator, root_path, .{
+        .cache_ttl_seconds = 1800,
+        .refresh_cache = true,
+    });
+
+    try std.testing.expectEqual(@as(u64, 2), stats.file_count);
+    try std.testing.expectEqual(@as(u64, 2), stats.dir_count);
+
+    const root_cached = try zduTestRequireCachedStats(root_path, allocator);
+    const a_cached = try zduTestRequireCachedStats(a_path, allocator);
+
+    try std.testing.expectEqual(@as(u64, 2), root_cached.file_count);
+    try std.testing.expectEqual(@as(u64, 2), root_cached.dir_count);
+    try std.testing.expectEqual(@as(u64, 2), a_cached.file_count);
+    try std.testing.expectEqual(@as(u64, 1), a_cached.dir_count);
+}
+
+test "dir stats xattr cache stores file counts and rejects expired or malformed records" {
     switch (builtin.os.tag) {
         .linux, .macos => {},
         else => return error.SkipZigTest,
@@ -2037,33 +2782,52 @@ test "dir size xattr cache accepts fresh records and rejects expired or malforme
 
     Model.clearCachedDirSize(dir_path, allocator);
 
-    Model.writeCachedDirSize(dir_path, 1234, 60, allocator);
+    const written_stats: Model.DirStats = .{ .size = 1234, .file_count = 9, .dir_count = 2 };
+    Model.writeCachedDirStats(dir_path, written_stats, 60, allocator);
 
-    const fresh = Model.readCachedDirSize(dir_path, allocator) orelse return error.SkipZigTest;
-    try std.testing.expectEqual(@as(u64, 1234), fresh);
+    const fresh = Model.readCachedDirStats(dir_path, allocator) orelse return error.SkipZigTest;
+    try std.testing.expectEqual(written_stats.size, fresh.size);
+    try std.testing.expectEqual(written_stats.file_count, fresh.file_count);
+    try std.testing.expectEqual(written_stats.dir_count, fresh.dir_count);
 
     var dir = std.Io.Dir.cwd().openDir(std.testing.io, dir_path, .{ .iterate = true }) catch return error.SkipZigTest;
     defer dir.close(std.testing.io);
 
-    try std.testing.expectEqual(@as(?u64, 1234), Model.readCachedDirSizeFd(dir));
+    const fresh_fd = Model.readCachedDirStatsFd(dir) orelse return error.SkipZigTest;
+    try std.testing.expectEqual(written_stats.size, fresh_fd.size);
+    try std.testing.expectEqual(written_stats.file_count, fresh_fd.file_count);
+    try std.testing.expectEqual(written_stats.dir_count, fresh_fd.dir_count);
 
     const now = Model.currentTimestampSeconds() orelse return error.SkipZigTest;
 
-    var expired_record: [16]u8 = undefined;
-    zduTestEncodeCacheRecord(
+    var expired_record: [32]u8 = undefined;
+    zduTestEncodeStatsCacheRecord(
         &expired_record,
-        5678,
+        .{ .size = 5678, .file_count = 3, .dir_count = 1 },
         if (now == 0) 0 else now - 1,
     );
 
-    try zduTestSetRawDirSizeXattr(dir_path, expired_record[0..], allocator);
-    try std.testing.expectEqual(@as(?u64, null), Model.readCachedDirSize(dir_path, allocator));
+    try zduTestSetRawDirStatsXattr(dir_path, expired_record[0..], allocator);
+    try std.testing.expect(Model.readCachedDirStats(dir_path, allocator) == null);
 
-    var malformed_record: [15]u8 = undefined;
-    @memset(&malformed_record, 0xaa);
+    var malformed_record: [31]u8 = undefined;
+    @memset(malformed_record[0..], 0xaa);
 
-    try zduTestSetRawDirSizeXattr(dir_path, malformed_record[0..], allocator);
-    try std.testing.expectEqual(@as(?u64, null), Model.readCachedDirSize(dir_path, allocator));
+    try zduTestSetRawDirStatsXattr(dir_path, malformed_record[0..], allocator);
+    try std.testing.expect(Model.readCachedDirStats(dir_path, allocator) == null);
+
+    var legacy_record: [16]u8 = undefined;
+    zduTestEncodeCacheRecord(
+        &legacy_record,
+        7777,
+        now + 60,
+    );
+
+    try zduTestSetRawDirSizeXattr(dir_path, legacy_record[0..], allocator);
+    const legacy = Model.readCachedDirStats(dir_path, allocator) orelse return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u64, 7777), legacy.size);
+    try std.testing.expectEqual(@as(u64, 0), legacy.file_count);
+    try std.testing.expectEqual(@as(u64, 0), legacy.dir_count);
 }
 
 test "expired dir size cache is recomputed and refreshed" {
@@ -2108,6 +2872,79 @@ test "expired dir size cache is recomputed and refreshed" {
 
     const refreshed = try zduTestRequireCachedSize(dir_path, allocator);
     try std.testing.expectEqual(stats.size, refreshed);
+}
+
+test "refresh cache ignores a still-fresh stats record" {
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return error.SkipZigTest,
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root/d");
+    try zduTestWriteFile(&tmp, "root/d/actual.dat", "actual contents");
+
+    const dir_path = try zduTestTmpPath(allocator, &tmp, "root/d");
+    defer allocator.free(dir_path);
+
+    const stale: Model.DirStats = .{ .size = 999_999, .file_count = 99, .dir_count = 99 };
+    Model.writeCachedDirStats(dir_path, stale, 1800, allocator);
+
+    const refreshed = Model.computeDirStatsRefreshing(dir_path, allocator, std.testing.io, 1800);
+    try std.testing.expect(refreshed.size != stale.size);
+    try std.testing.expectEqual(@as(u64, 1), refreshed.file_count);
+    try std.testing.expectEqual(@as(u64, 1), refreshed.dir_count);
+
+    const cached = try zduTestRequireCachedStats(dir_path, allocator);
+    try std.testing.expectEqual(refreshed.size, cached.size);
+    try std.testing.expectEqual(refreshed.file_count, cached.file_count);
+    try std.testing.expectEqual(refreshed.dir_count, cached.dir_count);
+}
+
+test "parallel root scan matches serial stack scan" {
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return error.SkipZigTest,
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root/a");
+    try tmp.dir.createDirPath(std.testing.io, "root/b");
+    try zduTestWriteFile(&tmp, "root/a/one.txt", "1");
+    try zduTestWriteFile(&tmp, "root/a/two.txt", "22");
+    try zduTestWriteFile(&tmp, "root/b/three.txt", "333");
+    try zduTestWriteFile(&tmp, "root/four.txt", "4444");
+
+    const root_path = try zduTestTmpPath(allocator, &tmp, "root");
+    defer allocator.free(root_path);
+
+    const serial = try scanRootStats(std.testing.io, allocator, root_path, .{
+        .cache_ttl_seconds = 1800,
+        .refresh_cache = true,
+        .parallel = false,
+        .num_threads = 1,
+    });
+
+    const parallel = try scanRootStats(std.testing.io, allocator, root_path, .{
+        .cache_ttl_seconds = 1800,
+        .refresh_cache = true,
+        .parallel = true,
+        .num_threads = 2,
+    });
+
+    try std.testing.expectEqual(serial.size, parallel.size);
+    try std.testing.expectEqual(serial.file_count, parallel.file_count);
+    try std.testing.expectEqual(serial.dir_count, parallel.dir_count);
+    try std.testing.expectEqual(@as(u64, 4), parallel.file_count);
+    try std.testing.expectEqual(@as(u64, 3), parallel.dir_count);
 }
 
 test "model does not process /proc" {
