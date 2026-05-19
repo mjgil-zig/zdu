@@ -149,6 +149,52 @@ pub const Model = struct {
         mutex: std.Io.Mutex = .init,
     };
 
+    const dynamic_split_min_files: u64 = 4096;
+    const dynamic_wait_sleep_ns: u64 = 100_000;
+
+    const DynamicScanInput = struct {
+        path: []const u8,
+        estimate_files: u64,
+    };
+
+    const DynamicScanFuture = struct {
+        mutex: std.Io.Mutex = .init,
+        done: bool = false,
+        stats: DirStats = .{},
+    };
+
+    const DynamicScanTask = struct {
+        path: []u8,
+        estimate_files: u64,
+        future: *DynamicScanFuture,
+    };
+
+    const DynamicWork = union(enum) {
+        task: DynamicScanTask,
+        wait,
+        done,
+    };
+
+    const DynamicScanContext = struct {
+        io: std.Io,
+        allocator: mem.Allocator,
+        cache_ttl_seconds: u64,
+        refresh_cache: bool,
+        worker_count: usize,
+        split_threshold_files: u64 = dynamic_split_min_files,
+        tasks: std.ArrayList(DynamicScanTask) = .empty,
+        active_tasks: usize = 0,
+        mutex: std.Io.Mutex = .init,
+    };
+
+    const DynamicFrame = struct {
+        path: []u8,
+        dir: std.Io.Dir,
+        iter: std.Io.Dir.Iterator,
+        total: DirStats = .{ .dir_count = 1 },
+        pending: std.ArrayList(*DynamicScanFuture) = .empty,
+    };
+
     const Loading = struct {
         processed: usize = 0,
         entry_index: usize = 0,
@@ -482,10 +528,290 @@ pub const Model = struct {
         }.less);
     }
 
+    fn dynamicTaskLess(a: DynamicScanTask, b: DynamicScanTask) bool {
+        if (a.estimate_files != b.estimate_files) return a.estimate_files > b.estimate_files;
+        return mem.lessThan(u8, a.path, b.path);
+    }
+
+    fn deinitDynamicContext(ctx: *DynamicScanContext) void {
+        for (ctx.tasks.items) |task| ctx.allocator.free(task.path);
+        ctx.tasks.deinit(ctx.allocator);
+    }
+
+    fn enqueueDynamicTask(ctx: *DynamicScanContext, path: []u8, future: *DynamicScanFuture, estimate_files: u64) bool {
+        ctx.mutex.lockUncancelable(ctx.io);
+        defer ctx.mutex.unlock(ctx.io);
+
+        ctx.tasks.append(ctx.allocator, .{
+            .path = path,
+            .estimate_files = estimate_files,
+            .future = future,
+        }) catch return false;
+        return true;
+    }
+
+    fn takeDynamicWork(ctx: *DynamicScanContext) DynamicWork {
+        ctx.mutex.lockUncancelable(ctx.io);
+        defer ctx.mutex.unlock(ctx.io);
+
+        if (ctx.tasks.items.len > 0) {
+            var best_index: usize = 0;
+            var i: usize = 1;
+            while (i < ctx.tasks.items.len) : (i += 1) {
+                if (dynamicTaskLess(ctx.tasks.items[i], ctx.tasks.items[best_index])) best_index = i;
+            }
+            const task = ctx.tasks.swapRemove(best_index);
+            ctx.active_tasks += 1;
+            return .{ .task = task };
+        }
+
+        if (ctx.active_tasks == 0) return .done;
+        return .wait;
+    }
+
+    fn finishDynamicTask(ctx: *DynamicScanContext) void {
+        ctx.mutex.lockUncancelable(ctx.io);
+        defer ctx.mutex.unlock(ctx.io);
+
+        if (ctx.active_tasks > 0) ctx.active_tasks -= 1;
+    }
+
+    fn completeDynamicFuture(io: std.Io, future: *DynamicScanFuture, stats: DirStats) void {
+        future.mutex.lockUncancelable(io);
+        defer future.mutex.unlock(io);
+
+        future.stats = stats;
+        future.done = true;
+    }
+
+    fn readDynamicFuture(io: std.Io, future: *DynamicScanFuture) ?DirStats {
+        future.mutex.lockUncancelable(io);
+        defer future.mutex.unlock(io);
+
+        if (!future.done) return null;
+        return future.stats;
+    }
+
+    fn dynamicWorkPressure(ctx: *DynamicScanContext) usize {
+        ctx.mutex.lockUncancelable(ctx.io);
+        defer ctx.mutex.unlock(ctx.io);
+
+        return ctx.tasks.items.len + ctx.active_tasks;
+    }
+
+    fn shouldSplitDynamicChild(ctx: *DynamicScanContext, estimate_files: u64) bool {
+        if (ctx.worker_count <= 1) return false;
+        if (estimate_files >= ctx.split_threshold_files and estimate_files > 0) return true;
+        return dynamicWorkPressure(ctx) < ctx.worker_count;
+    }
+
+    fn cleanupDynamicFrame(frame: *DynamicFrame, allocator: mem.Allocator, io: std.Io) void {
+        for (frame.pending.items) |future| allocator.destroy(future);
+        frame.pending.deinit(allocator);
+        frame.dir.close(io);
+        allocator.free(frame.path);
+    }
+
+    fn pushDynamicFrame(stack: *std.ArrayList(DynamicFrame), allocator: mem.Allocator, io: std.Io, path: []u8, dir: std.Io.Dir) bool {
+        var owned_dir = dir;
+        stack.append(allocator, .{
+            .path = path,
+            .dir = owned_dir,
+            .iter = owned_dir.iterateAssumeFirstIteration(),
+        }) catch {
+            owned_dir.close(io);
+            allocator.free(path);
+            return false;
+        };
+        return true;
+    }
+
+    fn waitDynamicFuture(ctx: *DynamicScanContext, future: *DynamicScanFuture) DirStats {
+        while (true) {
+            if (readDynamicFuture(ctx.io, future)) |stats| return stats;
+
+            switch (takeDynamicWork(ctx)) {
+                .task => |task| runDynamicTask(ctx, task),
+                .wait => _ = ctx.io.sleep(.fromNanoseconds(dynamic_wait_sleep_ns), .awake) catch {},
+                .done => return .{},
+            }
+        }
+    }
+
+    fn completeDynamicFrame(ctx: *DynamicScanContext, frame: *DynamicFrame) DirStats {
+        for (frame.pending.items) |future| {
+            const stats = waitDynamicFuture(ctx, future);
+            addStats(&frame.total, stats);
+            ctx.allocator.destroy(future);
+        }
+        writeCachedDirStatsFd(frame.dir, frame.total, ctx.cache_ttl_seconds);
+        return frame.total;
+    }
+
+    fn splitDynamicChild(ctx: *DynamicScanContext, frame: *DynamicFrame, child_path: []u8, estimate_files: u64) bool {
+        if (!shouldSplitDynamicChild(ctx, estimate_files)) return false;
+
+        const future = ctx.allocator.create(DynamicScanFuture) catch return false;
+        future.* = .{};
+
+        frame.pending.append(ctx.allocator, future) catch {
+            ctx.allocator.destroy(future);
+            return false;
+        };
+
+        if (enqueueDynamicTask(ctx, child_path, future, estimate_files)) return true;
+
+        _ = frame.pending.pop();
+        ctx.allocator.destroy(future);
+        return false;
+    }
+
+    fn computeDirStatsDynamicOwned(ctx: *DynamicScanContext, root_path: []u8) DirStats {
+        if (zdu.isGeneratedDirPath(root_path)) {
+            ctx.allocator.free(root_path);
+            return .{};
+        }
+
+        var root_dir = std.Io.Dir.cwd().openDir(ctx.io, root_path, .{ .iterate = true }) catch {
+            ctx.allocator.free(root_path);
+            return .{ .dir_count = 1 };
+        };
+
+        if (!ctx.refresh_cache and ctx.cache_ttl_seconds > 0) {
+            if (readCachedDirStatsFd(root_dir)) |cached_stats| {
+                root_dir.close(ctx.io);
+                ctx.allocator.free(root_path);
+                return cached_stats;
+            }
+        }
+
+        var stack: std.ArrayList(DynamicFrame) = .empty;
+        defer {
+            for (stack.items) |*frame| cleanupDynamicFrame(frame, ctx.allocator, ctx.io);
+            stack.deinit(ctx.allocator);
+        }
+
+        if (!pushDynamicFrame(&stack, ctx.allocator, ctx.io, root_path, root_dir)) return .{};
+
+        while (stack.items.len > 0) {
+            var frame = &stack.items[stack.items.len - 1];
+            if (frame.iter.next(ctx.io) catch null) |entry| {
+                if (entry.kind == .file) {
+                    addStats(&frame.total, fileEntryStats(fileSizeOnDiskAt(frame.dir, entry.name, ctx.io)));
+                    continue;
+                }
+                if (entry.kind != .directory) continue;
+
+                const child_path = std.fs.path.join(ctx.allocator, &.{ frame.path, entry.name }) catch continue;
+                if (zdu.isGeneratedDirPath(child_path)) {
+                    ctx.allocator.free(child_path);
+                    continue;
+                }
+
+                const cached = if (ctx.cache_ttl_seconds > 0) readCachedDirStats(child_path, ctx.allocator) else null;
+                if (!ctx.refresh_cache) {
+                    if (cached) |cached_stats| {
+                        addStats(&frame.total, cached_stats);
+                        ctx.allocator.free(child_path);
+                        continue;
+                    }
+                }
+
+                const estimate_files = if (cached) |cached_stats| cached_stats.file_count else 0;
+                if (splitDynamicChild(ctx, frame, child_path, estimate_files)) continue;
+
+                const child_dir = frame.dir.openDir(ctx.io, entry.name, .{ .iterate = true }) catch {
+                    ctx.allocator.free(child_path);
+                    continue;
+                };
+                if (!pushDynamicFrame(&stack, ctx.allocator, ctx.io, child_path, child_dir)) continue;
+                continue;
+            }
+
+            var completed = stack.pop().?;
+            const completed_stats = completeDynamicFrame(ctx, &completed);
+            completed.pending.deinit(ctx.allocator);
+            completed.dir.close(ctx.io);
+            ctx.allocator.free(completed.path);
+
+            if (stack.items.len > 0) {
+                addStats(&stack.items[stack.items.len - 1].total, completed_stats);
+            } else {
+                return completed_stats;
+            }
+        }
+
+        return .{};
+    }
+
+    fn runDynamicTask(ctx: *DynamicScanContext, task: DynamicScanTask) void {
+        defer finishDynamicTask(ctx);
+        const stats = computeDirStatsDynamicOwned(ctx, task.path);
+        completeDynamicFuture(ctx.io, task.future, stats);
+    }
+
+    fn dynamicScanWorker(ctx: *DynamicScanContext) void {
+        while (true) {
+            switch (takeDynamicWork(ctx)) {
+                .task => |task| runDynamicTask(ctx, task),
+                .wait => _ = ctx.io.sleep(.fromNanoseconds(dynamic_wait_sleep_ns), .awake) catch {},
+                .done => return,
+            }
+        }
+    }
+
+    fn runDynamicScanWorkers(ctx: *DynamicScanContext, worker_count: usize) !void {
+        const threads = try ctx.allocator.alloc(std.Thread, worker_count);
+        defer ctx.allocator.free(threads);
+
+        var spawned: usize = 0;
+        errdefer {
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+        while (spawned < worker_count) : (spawned += 1) {
+            threads[spawned] = try std.Thread.spawn(.{}, dynamicScanWorker, .{ctx});
+        }
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+
+    fn computeDynamicScanInputs(io: std.Io, allocator: mem.Allocator, inputs: []const DynamicScanInput, options: Options, worker_count: usize) ![]DirStats {
+        const results = try allocator.alloc(DirStats, inputs.len);
+        errdefer allocator.free(results);
+        for (results) |*result| result.* = .{};
+
+        const futures = try allocator.alloc(DynamicScanFuture, inputs.len);
+        defer allocator.free(futures);
+        for (futures) |*future| future.* = .{};
+
+        var ctx = DynamicScanContext{
+            .io = io,
+            .allocator = allocator,
+            .cache_ttl_seconds = options.cache_ttl_seconds,
+            .refresh_cache = options.refresh_cache,
+            .worker_count = worker_count,
+        };
+        defer deinitDynamicContext(&ctx);
+
+        for (inputs, 0..) |input, i| {
+            const owned_path = try allocator.dupe(u8, input.path);
+            if (!enqueueDynamicTask(&ctx, owned_path, &futures[i], input.estimate_files)) {
+                allocator.free(owned_path);
+                return error.OutOfMemory;
+            }
+        }
+
+        try runDynamicScanWorkers(&ctx, worker_count);
+
+        for (futures, 0..) |*future, i| {
+            results[i] = readDynamicFuture(io, future) orelse .{};
+        }
+        return results;
+    }
+
     fn entryScanWorkerCount(parallel: bool, requested: usize, task_count: usize) usize {
-        if (!parallel or task_count <= 1) return 1;
+        if (!parallel or task_count == 0) return 1;
         const detected = if (requested == 0) std.Thread.getCpuCount() catch 1 else requested;
-        return @max(@as(usize, 1), @min(detected, task_count));
+        return @max(@as(usize, 1), detected);
     }
 
     fn nextEntryScanTask(ctx: *EntryScanContext) ?usize {
@@ -513,30 +839,22 @@ pub const Model = struct {
 
         const worker_count = entryScanWorkerCount(model.parallel, model.num_threads, tasks.len);
         if (worker_count > 1) {
-            const results = try model.allocator.alloc(DirStats, tasks.len);
-            defer model.allocator.free(results);
-            for (results) |*result| result.* = .{};
+            const inputs = try model.allocator.alloc(DynamicScanInput, tasks.len);
+            defer model.allocator.free(inputs);
+            for (tasks, 0..) |task, i| {
+                inputs[i] = .{
+                    .path = task.path,
+                    .estimate_files = task.estimate_files,
+                };
+            }
 
-            var ctx = EntryScanContext{
-                .io = model.io,
-                .allocator = model.allocator,
+            const results = try computeDynamicScanInputs(model.io, model.allocator, inputs, .{
                 .cache_ttl_seconds = model.cache_ttl_seconds,
                 .refresh_cache = model.refresh_cache,
-                .tasks = tasks,
-                .results = results,
-            };
-
-            const threads = try model.allocator.alloc(std.Thread, worker_count);
-            defer model.allocator.free(threads);
-
-            var spawned: usize = 0;
-            errdefer {
-                for (threads[0..spawned]) |thread| thread.join();
-            }
-            while (spawned < worker_count) : (spawned += 1) {
-                threads[spawned] = try std.Thread.spawn(.{}, entryScanWorker, .{&ctx});
-            }
-            for (threads[0..spawned]) |thread| thread.join();
+                .parallel = model.parallel,
+                .num_threads = model.num_threads,
+            }, worker_count);
+            defer model.allocator.free(results);
 
             for (tasks, results) |task, stats| {
                 if (task.entry_index < entries.len) updateEntryStats(&entries[task.entry_index], stats);
@@ -2592,9 +2910,9 @@ fn parallelScanWorker(ctx: *ParallelScanContext) void {
 }
 
 fn resolvedWorkerCount(parallel: bool, requested: usize, task_count: usize) usize {
-    if (!parallel or task_count <= 1) return 1;
+    if (!parallel or task_count == 0) return 1;
     const detected = if (requested == 0) std.Thread.getCpuCount() catch 1 else requested;
-    return @max(@as(usize, 1), @min(detected, task_count));
+    return @max(@as(usize, 1), detected);
 }
 
 fn scanRootStatsMode(io: std.Io, allocator: mem.Allocator, cwd: []const u8, opts: RootScanOptions, mode: RootScanMode) !Model.DirStats {
@@ -2633,30 +2951,22 @@ fn scanRootStatsMode(io: std.Io, allocator: mem.Allocator, cwd: []const u8, opts
 
     const worker_count = resolvedWorkerCount(opts.parallel and mode == .stack, opts.num_threads, tasks.items.len);
     if (worker_count > 1) {
-        const results = try allocator.alloc(Model.DirStats, tasks.items.len);
-        defer allocator.free(results);
-        for (results) |*result| result.* = .{};
+        const inputs = try allocator.alloc(Model.DynamicScanInput, tasks.items.len);
+        defer allocator.free(inputs);
+        for (tasks.items, 0..) |task, i| {
+            inputs[i] = .{
+                .path = task.path,
+                .estimate_files = task.estimate_files,
+            };
+        }
 
-        var ctx = ParallelScanContext{
-            .io = io,
-            .allocator = allocator,
+        const results = try Model.computeDynamicScanInputs(io, allocator, inputs, .{
             .cache_ttl_seconds = opts.cache_ttl_seconds,
             .refresh_cache = opts.refresh_cache,
-            .tasks = tasks.items,
-            .results = results,
-        };
-
-        const threads = try allocator.alloc(std.Thread, worker_count);
-        defer allocator.free(threads);
-
-        var spawned: usize = 0;
-        errdefer {
-            for (threads[0..spawned]) |thread| thread.join();
-        }
-        while (spawned < worker_count) : (spawned += 1) {
-            threads[spawned] = try std.Thread.spawn(.{}, parallelScanWorker, .{&ctx});
-        }
-        for (threads[0..spawned]) |thread| thread.join();
+            .parallel = opts.parallel,
+            .num_threads = opts.num_threads,
+        }, worker_count);
+        defer allocator.free(results);
 
         for (results) |stats| Model.addStats(&root_stats, stats);
     } else {
@@ -3303,6 +3613,69 @@ test "parallel root scan matches serial stack scan" {
     try std.testing.expectEqual(serial.dir_count, parallel.dir_count);
     try std.testing.expectEqual(@as(u64, 4), parallel.file_count);
     try std.testing.expectEqual(@as(u64, 3), parallel.dir_count);
+}
+
+test "dynamic parallel scan splits nested children and waits before parent cache write" {
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return error.SkipZigTest,
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root/huge/a");
+    try tmp.dir.createDirPath(std.testing.io, "root/huge/b");
+    try zduTestWriteFile(&tmp, "root/huge/a/one.txt", "1");
+    try zduTestWriteFile(&tmp, "root/huge/b/two.txt", "22");
+    try zduTestWriteFile(&tmp, "root/huge/local.txt", "333");
+
+    const huge_path = try zduTestTmpPath(allocator, &tmp, "root/huge");
+    defer allocator.free(huge_path);
+    const a_path = try zduTestTmpPath(allocator, &tmp, "root/huge/a");
+    defer allocator.free(a_path);
+    const b_path = try zduTestTmpPath(allocator, &tmp, "root/huge/b");
+    defer allocator.free(b_path);
+
+    Model.writeCachedDirStats(a_path, .{ .size = 999_999, .file_count = Model.dynamic_split_min_files, .dir_count = 1 }, 1800, allocator);
+    Model.writeCachedDirStats(b_path, .{ .size = 888_888, .file_count = Model.dynamic_split_min_files, .dir_count = 1 }, 1800, allocator);
+
+    const inputs = [_]Model.DynamicScanInput{
+        .{ .path = huge_path, .estimate_files = Model.dynamic_split_min_files * 2 },
+    };
+
+    const results = try Model.computeDynamicScanInputs(std.testing.io, allocator, inputs[0..], .{
+        .cache_ttl_seconds = 1800,
+        .refresh_cache = true,
+        .parallel = true,
+        .num_threads = 2,
+    }, 2);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(u64, 3), results[0].file_count);
+    try std.testing.expectEqual(@as(u64, 3), results[0].dir_count);
+
+    const huge_cached = try zduTestRequireCachedStats(huge_path, allocator);
+    try std.testing.expectEqual(results[0].size, huge_cached.size);
+    try std.testing.expectEqual(@as(u64, 3), huge_cached.file_count);
+    try std.testing.expectEqual(@as(u64, 3), huge_cached.dir_count);
+
+    const a_cached = try zduTestRequireCachedStats(a_path, allocator);
+    const b_cached = try zduTestRequireCachedStats(b_path, allocator);
+    try std.testing.expectEqual(@as(u64, 1), a_cached.file_count);
+    try std.testing.expectEqual(@as(u64, 1), b_cached.file_count);
+    try std.testing.expect(a_cached.size != 999_999);
+    try std.testing.expect(b_cached.size != 888_888);
+}
+
+test "parallel worker count can exceed initial task count for dynamic splitting" {
+    try std.testing.expectEqual(@as(usize, 4), resolvedWorkerCount(true, 4, 1));
+    try std.testing.expectEqual(@as(usize, 3), Model.entryScanWorkerCount(true, 3, 1));
+    try std.testing.expectEqual(@as(usize, 1), resolvedWorkerCount(true, 4, 0));
+    try std.testing.expectEqual(@as(usize, 1), Model.entryScanWorkerCount(false, 3, 8));
 }
 
 test "TUI refresh-cache parallel jobs scan entries" {

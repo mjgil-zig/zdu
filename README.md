@@ -90,9 +90,11 @@ The delete confirmation prompt highlights the uppercase `Y` in `[Y/n]`; pressing
 
 ## Parallel cache refresh
 
-`--parallel` enables a root scan that splits immediate child directories into work items. The scheduler sorts those items by cached recursive file count, so larger cached subtrees are scheduled first. Each worker uses the stack-machine scanner and writes directory stats bottom-up.
+`--parallel` enables dynamic directory-subtree splitting. The scheduler starts with immediate child directories, then lets workers split newly discovered large child directories into additional work items. Cached recursive file counts are used as cost estimates, so larger cached subtrees are scheduled first; when estimates are unavailable, workers still split while the shared queue is underfed.
 
-The same flags work in both modes. In TUI mode, startup and directory-entry scans carry `--refresh-cache`, `--parallel`, and `--jobs` into the model. In no-TUI mode, the root summary scan uses the same options and prints the final total.
+Parent directories wait for any split child futures before writing their own xattr, so directory stats are still written bottom-up even when work is split dynamically across workers. `--jobs` is not capped by the number of immediate child directories; a single huge top-level directory can still fan out into multiple nested worker tasks.
+
+The same flags work in both modes. In TUI mode, startup and directory-entry scans carry `--refresh-cache`, `--parallel`, and `--jobs` into the model. In no-TUI mode, the root summary scan uses the same dynamic scheduler and prints the final total.
 
 ```bash
 zdu --no-tui --parallel --jobs 8 --refresh-cache --cache-ttl 1800 /path/to/scan
