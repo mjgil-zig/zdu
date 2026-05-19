@@ -151,6 +151,7 @@ pub const Model = struct {
 
     const dynamic_split_min_files: u64 = 4096;
     const dynamic_wait_sleep_ns: u64 = 100_000;
+    const dynamic_worker_stack_size: usize = 3 * 1024 * 1024;
 
     const DynamicScanInput = struct {
         path: []const u8,
@@ -769,7 +770,9 @@ pub const Model = struct {
             for (threads[0..spawned]) |thread| thread.join();
         }
         while (spawned < worker_count) : (spawned += 1) {
-            threads[spawned] = try std.Thread.spawn(.{}, dynamicScanWorker, .{ctx});
+            threads[spawned] = try std.Thread.spawn(.{
+                .stack_size = dynamic_worker_stack_size,
+            }, dynamicScanWorker, .{ctx});
         }
         for (threads[0..spawned]) |thread| thread.join();
     }
