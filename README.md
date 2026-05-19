@@ -90,10 +90,16 @@ The delete confirmation prompt highlights the uppercase `Y` in `[Y/n]`; pressing
 
 ## Parallel cache refresh
 
-`--parallel` enables a no-TUI root scan that splits immediate child directories into work items. The scheduler sorts those items by cached recursive file count, so larger cached subtrees are scheduled first. Each worker uses the stack-machine scanner and writes directory stats bottom-up.
+`--parallel` enables a root scan that splits immediate child directories into work items. The scheduler sorts those items by cached recursive file count, so larger cached subtrees are scheduled first. Each worker uses the stack-machine scanner and writes directory stats bottom-up.
+
+The same flags work in both modes. In TUI mode, startup and directory-entry scans carry `--refresh-cache`, `--parallel`, and `--jobs` into the model. In no-TUI mode, the root summary scan uses the same options and prints the final total.
 
 ```bash
 zdu --no-tui --parallel --jobs 8 --refresh-cache --cache-ttl 1800 /path/to/scan
+```
+
+```bash
+zdu --parallel --jobs 8 --refresh-cache --cache-ttl 1800 /path/to/scan
 ```
 
 This is most useful with a warm v3 cache, because cached file counts give the scheduler a better estimate of subtree cost.
@@ -112,3 +118,4 @@ The library API is summary-oriented: `scan()` returns totals without retaining p
 - `zdu --no-tui [path]`
 - `zdu --no-tui --refresh-cache --cache-ttl 1800 [path]`
 - `zdu --no-tui --parallel --jobs 8 --refresh-cache --cache-ttl 1800 [path]`
+- `zdu --parallel --jobs 8 --refresh-cache --cache-ttl 1800 [path]`

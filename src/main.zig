@@ -63,6 +63,9 @@ pub const Model = struct {
     parent: ?*Model = null,
     spinner_frame: usize = 0,
     cache_ttl_seconds: u64 = 0,
+    refresh_cache: bool = false,
+    parallel: bool = false,
+    num_threads: usize = 0,
 
     const loading_frames = [_][]const u8{ "|", "/", "-", "\\" };
     const loading_tick_ms: u32 = 16;
@@ -85,6 +88,13 @@ pub const Model = struct {
         size: u64 = 0,
         file_count: u64 = 0,
         dir_count: u64 = 0,
+    };
+
+    pub const Options = struct {
+        cache_ttl_seconds: u64 = 0,
+        refresh_cache: bool = false,
+        parallel: bool = false,
+        num_threads: usize = 0,
     };
 
     const EntryRole = enum {
@@ -122,6 +132,23 @@ pub const Model = struct {
         dir: std.Io.Dir,
     };
 
+    const EntryScanTask = struct {
+        path: []u8,
+        entry_index: usize,
+        estimate_files: u64,
+    };
+
+    const EntryScanContext = struct {
+        io: std.Io,
+        allocator: mem.Allocator,
+        cache_ttl_seconds: u64,
+        refresh_cache: bool,
+        tasks: []const EntryScanTask,
+        results: []DirStats,
+        next_index: usize = 0,
+        mutex: std.Io.Mutex = .init,
+    };
+
     const Loading = struct {
         processed: usize = 0,
         entry_index: usize = 0,
@@ -132,7 +159,7 @@ pub const Model = struct {
         started_at: std.Io.Timestamp,
     };
 
-    fn createModel(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !*Model {
+    fn createModel(io: std.Io, allocator: mem.Allocator, cwd: []const u8, options: Options) !*Model {
         const model = try allocator.create(Model);
         errdefer allocator.destroy(model);
 
@@ -143,7 +170,10 @@ pub const Model = struct {
             .io = io,
             .allocator = allocator,
             .cwd = owned_cwd,
-            .cache_ttl_seconds = cache_ttl_seconds,
+            .cache_ttl_seconds = options.cache_ttl_seconds,
+            .refresh_cache = options.refresh_cache,
+            .parallel = options.parallel,
+            .num_threads = options.num_threads,
         };
         return model;
     }
@@ -248,7 +278,11 @@ pub const Model = struct {
     }
 
     pub fn initWithCache(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !*Model {
-        const model = try createModel(io, allocator, cwd, cache_ttl_seconds);
+        return initWithOptions(io, allocator, cwd, .{ .cache_ttl_seconds = cache_ttl_seconds });
+    }
+
+    pub fn initWithOptions(io: std.Io, allocator: mem.Allocator, cwd: []const u8, options: Options) !*Model {
+        const model = try createModel(io, allocator, cwd, options);
         errdefer model.deinit();
         try model.primeDirXattrs();
         try model.loadDir();
@@ -260,7 +294,11 @@ pub const Model = struct {
     }
 
     pub fn initLoadingWithCache(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !*Model {
-        const model = try createModel(io, allocator, cwd, cache_ttl_seconds);
+        return initLoadingWithOptions(io, allocator, cwd, .{ .cache_ttl_seconds = cache_ttl_seconds });
+    }
+
+    pub fn initLoadingWithOptions(io: std.Io, allocator: mem.Allocator, cwd: []const u8, options: Options) !*Model {
+        const model = try createModel(io, allocator, cwd, options);
         errdefer model.deinit();
         try model.beginLoading();
         return model;
@@ -388,6 +426,9 @@ pub const Model = struct {
                     const full_path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name });
                     defer model.allocator.free(full_path);
                     if (zdu.isGeneratedDirPath(full_path)) continue;
+                    if (model.refresh_cache) {
+                        break :blk computeDirStatsRefreshing(full_path, model.allocator, model.io, model.cache_ttl_seconds);
+                    }
                     break :blk readCachedDirStats(full_path, model.allocator) orelse .{};
                 } else fileEntryStats(fileSizeOnDiskAt(dir, entry.name, model.io)),
                 .loading => blk: {
@@ -425,11 +466,185 @@ pub const Model = struct {
             defer model.allocator.free(full_path);
             if (zdu.isGeneratedDirPath(full_path)) continue;
 
-            _ = computeDirStats(full_path, model.allocator, model.io, model.cache_ttl_seconds);
+            _ = if (model.refresh_cache)
+                computeDirStatsRefreshing(full_path, model.allocator, model.io, model.cache_ttl_seconds)
+            else
+                computeDirStats(full_path, model.allocator, model.io, model.cache_ttl_seconds);
         }
     }
 
+    fn sortEntryScanTasks(tasks: []EntryScanTask) void {
+        mem.sortUnstable(EntryScanTask, tasks, {}, struct {
+            fn less(_: void, a: EntryScanTask, b: EntryScanTask) bool {
+                if (a.estimate_files != b.estimate_files) return a.estimate_files > b.estimate_files;
+                return mem.lessThan(u8, a.path, b.path);
+            }
+        }.less);
+    }
+
+    fn entryScanWorkerCount(parallel: bool, requested: usize, task_count: usize) usize {
+        if (!parallel or task_count <= 1) return 1;
+        const detected = if (requested == 0) std.Thread.getCpuCount() catch 1 else requested;
+        return @max(@as(usize, 1), @min(detected, task_count));
+    }
+
+    fn nextEntryScanTask(ctx: *EntryScanContext) ?usize {
+        ctx.mutex.lockUncancelable(ctx.io);
+        defer ctx.mutex.unlock(ctx.io);
+
+        if (ctx.next_index >= ctx.tasks.len) return null;
+        const idx = ctx.next_index;
+        ctx.next_index += 1;
+        return idx;
+    }
+
+    fn entryScanWorker(ctx: *EntryScanContext) void {
+        while (nextEntryScanTask(ctx)) |idx| {
+            ctx.results[idx] = if (ctx.refresh_cache) blk: {
+                break :blk computeDirStatsStackRefreshing(ctx.tasks[idx].path, ctx.allocator, ctx.io, ctx.cache_ttl_seconds) catch .{};
+            } else blk: {
+                break :blk computeDirStatsStack(ctx.tasks[idx].path, ctx.allocator, ctx.io, ctx.cache_ttl_seconds) catch .{};
+            };
+        }
+    }
+
+    fn scanEntryTasks(model: *Model, tasks: []const EntryScanTask, entries: []Entry) !void {
+        if (tasks.len == 0) return;
+
+        const worker_count = entryScanWorkerCount(model.parallel, model.num_threads, tasks.len);
+        if (worker_count > 1) {
+            const results = try model.allocator.alloc(DirStats, tasks.len);
+            defer model.allocator.free(results);
+            for (results) |*result| result.* = .{};
+
+            var ctx = EntryScanContext{
+                .io = model.io,
+                .allocator = model.allocator,
+                .cache_ttl_seconds = model.cache_ttl_seconds,
+                .refresh_cache = model.refresh_cache,
+                .tasks = tasks,
+                .results = results,
+            };
+
+            const threads = try model.allocator.alloc(std.Thread, worker_count);
+            defer model.allocator.free(threads);
+
+            var spawned: usize = 0;
+            errdefer {
+                for (threads[0..spawned]) |thread| thread.join();
+            }
+            while (spawned < worker_count) : (spawned += 1) {
+                threads[spawned] = try std.Thread.spawn(.{}, entryScanWorker, .{&ctx});
+            }
+            for (threads[0..spawned]) |thread| thread.join();
+
+            for (tasks, results) |task, stats| {
+                if (task.entry_index < entries.len) updateEntryStats(&entries[task.entry_index], stats);
+            }
+            return;
+        }
+
+        for (tasks) |task| {
+            const stats = if (model.refresh_cache) blk: {
+                break :blk try computeDirStatsStackRefreshing(task.path, model.allocator, model.io, model.cache_ttl_seconds);
+            } else blk: {
+                break :blk try computeDirStatsStack(task.path, model.allocator, model.io, model.cache_ttl_seconds);
+            };
+            if (task.entry_index < entries.len) updateEntryStats(&entries[task.entry_index], stats);
+        }
+    }
+
+    fn loadDirParallel(model: *Model) !void {
+        model.freeLoading();
+        model.freeEntries();
+
+        if (zdu.isGeneratedDirPath(model.cwd)) return;
+
+        var dir = std.Io.Dir.cwd().openDir(model.io, model.cwd, .{ .iterate = true }) catch return;
+        defer dir.close(model.io);
+
+        var entries_list: std.ArrayList(Entry) = .empty;
+        defer entries_list.deinit(model.allocator);
+        errdefer freeEntryItems(model.allocator, entries_list.items);
+
+        var tasks: std.ArrayList(EntryScanTask) = .empty;
+        defer {
+            for (tasks.items) |task| model.allocator.free(task.path);
+            tasks.deinit(model.allocator);
+        }
+
+        try appendParentEntry(model, &entries_list);
+
+        var iter = dir.iterate();
+        while (iter.next(model.io) catch null) |entry| {
+            const is_dir = entry.kind == .directory;
+            if (!is_dir and entry.kind != .file) continue;
+
+            if (is_dir) {
+                const full_path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name });
+                var owns_full_path = true;
+                errdefer if (owns_full_path) model.allocator.free(full_path);
+                if (zdu.isGeneratedDirPath(full_path)) {
+                    model.allocator.free(full_path);
+                    owns_full_path = false;
+                    continue;
+                }
+
+                const cached = if (!model.refresh_cache and model.cache_ttl_seconds > 0)
+                    readCachedDirStats(full_path, model.allocator)
+                else
+                    null;
+                const stats = cached orelse DirStats{};
+                const entry_index = entries_list.items.len;
+                try entries_list.append(model.allocator, try allocEntryOwned(
+                    model.allocator,
+                    entry.name,
+                    null,
+                    stats,
+                    true,
+                    .item,
+                ));
+
+                if (cached == null) {
+                    try tasks.append(model.allocator, .{
+                        .path = full_path,
+                        .entry_index = entry_index,
+                        .estimate_files = if (readCachedDirStats(full_path, model.allocator)) |cached_stats| cached_stats.file_count else 0,
+                    });
+                    owns_full_path = false;
+                } else {
+                    model.allocator.free(full_path);
+                    owns_full_path = false;
+                }
+            } else {
+                try entries_list.append(model.allocator, try allocEntryOwned(
+                    model.allocator,
+                    entry.name,
+                    null,
+                    fileEntryStats(fileSizeOnDiskAt(dir, entry.name, model.io)),
+                    false,
+                    .item,
+                ));
+            }
+        }
+
+        sortEntryScanTasks(tasks.items);
+        try model.scanEntryTasks(tasks.items, entries_list.items);
+
+        sortEntries(entries_list.items);
+
+        if (model.parent == null) {
+            try prependRootSummary(model.allocator, &entries_list, model.cwd);
+        }
+
+        writeCachedDirStatsFd(dir, currentDirStatsFromEntries(entries_list.items), model.cache_ttl_seconds);
+        model.entries = try entries_list.toOwnedSlice(model.allocator);
+        model.resetEntryView();
+    }
+
     pub fn loadDir(model: *Model) !void {
+        if (model.parallel) return model.loadDirParallel();
+
         model.freeLoading();
         model.freeEntries();
 
@@ -457,6 +672,11 @@ pub const Model = struct {
     }
 
     fn beginLoading(model: *Model) !void {
+        if (model.parallel) {
+            try model.loadDirParallel();
+            return;
+        }
+
         model.freeLoading();
         model.freeEntries();
 
@@ -519,7 +739,7 @@ pub const Model = struct {
                 }
 
                 if (entry.kind == .directory) {
-                    switch (openChildDirForScan(frame.dir, model.io, entry.name, model.cache_ttl_seconds, true) orelse return true) {
+                    switch (openChildDirForScan(frame.dir, model.io, entry.name, model.cache_ttl_seconds, !model.refresh_cache) orelse return true) {
                         .cached_stats => |cached_stats| {
                             addStats(&frame.total, cached_stats);
                             loading.processed_bytes += cached_stats.size;
@@ -566,7 +786,7 @@ pub const Model = struct {
             return true;
         }
 
-        switch (openChildDirForScan(loading.root_dir, model.io, entry.name, model.cache_ttl_seconds, true) orelse {
+        switch (openChildDirForScan(loading.root_dir, model.io, entry.name, model.cache_ttl_seconds, !model.refresh_cache) orelse {
             try model.finalizeLoadingEntry(idx, .{}, false);
             return true;
         }) {
@@ -642,22 +862,51 @@ pub const Model = struct {
         try entries.insert(allocator, 0, try allocEntryOwned(allocator, "", cwd, total_stats, true, .summary));
     }
 
+    fn hasStickyRootSummary(model: *const Model) bool {
+        return model.entries.len > 0 and model.entries[0].role == .summary;
+    }
+
+    fn stickyRootRows(model: *const Model, visible_rows: usize) usize {
+        return if (visible_rows > 0 and model.hasStickyRootSummary()) 1 else 0;
+    }
+
+    fn minScrollableEntryIndex(model: *const Model) usize {
+        return if (model.hasStickyRootSummary()) 1 else 0;
+    }
+
+    fn firstScrollableEntryIndex(model: *const Model) usize {
+        return @max(model.scroll_offset, model.minScrollableEntryIndex());
+    }
+
     fn ensureSelectionVisible(model: *Model, visible_rows: usize) void {
         if (visible_rows == 0) {
             model.scroll_offset = 0;
             return;
         }
 
-        if (model.selected < model.scroll_offset) {
-            model.scroll_offset = model.selected;
-        } else if (model.selected >= model.scroll_offset + visible_rows) {
-            model.scroll_offset = model.selected - visible_rows + 1;
+        const min_scroll = model.minScrollableEntryIndex();
+        const sticky_rows = model.stickyRootRows(visible_rows);
+        const scrollable_rows = visible_rows - sticky_rows;
+
+        if (scrollable_rows == 0) {
+            model.scroll_offset = min_scroll;
+            return;
         }
 
-        if (model.entries.len <= visible_rows) {
-            model.scroll_offset = 0;
+        model.scroll_offset = @max(model.scroll_offset, min_scroll);
+
+        if (model.selected < model.scroll_offset) {
+            model.scroll_offset = @max(model.selected, min_scroll);
+        } else if (model.selected >= model.scroll_offset + scrollable_rows) {
+            model.scroll_offset = model.selected - scrollable_rows + 1;
+        }
+
+        const scrollable_len = model.entries.len -| min_scroll;
+        if (scrollable_len <= scrollable_rows) {
+            model.scroll_offset = min_scroll;
         } else {
-            model.scroll_offset = @min(model.scroll_offset, model.entries.len - visible_rows);
+            const max_scroll = model.entries.len - scrollable_rows;
+            model.scroll_offset = @min(@max(model.scroll_offset, min_scroll), max_scroll);
         }
     }
 
@@ -1236,9 +1485,16 @@ pub const Model = struct {
 
     fn entryIndexForMouseRow(model: *Model, mouse_row: i16) ?usize {
         if (mouse_row < 2) return null;
-        const row = @as(usize, @intCast(mouse_row - 2));
+
+        const sticky_rows = model.stickyRootRows(1);
+        if (sticky_rows > 0 and mouse_row == 2) return null;
+
+        const row_offset: i16 = if (sticky_rows > 0) 3 else 2;
+        if (mouse_row < row_offset) return null;
+
+        const row = @as(usize, @intCast(mouse_row - row_offset));
         if (row >= model.last_visible_rows) return null;
-        const entry_idx = model.scroll_offset + row;
+        const entry_idx = model.firstScrollableEntryIndex() + row;
         if (entry_idx >= model.entries.len) return null;
         if (!isSelectableEntry(model.entries[entry_idx])) return null;
         return entry_idx;
@@ -1277,6 +1533,9 @@ pub const Model = struct {
         const io = model.io;
         const allocator = model.allocator;
         const cache_ttl_seconds = model.cache_ttl_seconds;
+        const refresh_cache = model.refresh_cache;
+        const parallel = model.parallel;
+        const num_threads = model.num_threads;
 
         const parent = try allocator.create(Model);
         errdefer allocator.destroy(parent);
@@ -1288,6 +1547,9 @@ pub const Model = struct {
             .cwd = next_cwd,
             .parent = parent,
             .cache_ttl_seconds = cache_ttl_seconds,
+            .refresh_cache = refresh_cache,
+            .parallel = parallel,
+            .num_threads = num_threads,
         };
         model.loadDir() catch {
             model.allocator.free(model.cwd);
@@ -1441,7 +1703,14 @@ pub const Model = struct {
                     }
                     return;
                 }
-                if (key.codepoint == vaxis.Key.backspace or key.codepoint == vaxis.Key.left or key.codepoint == vaxis.Key.escape) {
+                if (key.codepoint == vaxis.Key.left) {
+                    if (model.parent != null) {
+                        model.navigateUp() catch {};
+                        ctx.redraw = true;
+                    }
+                    return;
+                }
+                if (key.codepoint == vaxis.Key.backspace or key.codepoint == vaxis.Key.escape) {
                     if (model.parent == null) {
                         ctx.quit = true;
                     } else {
@@ -1581,6 +1850,27 @@ pub const Model = struct {
         try writeText(surface, allocator, meta, center_row + 1, meta_col, .{ .fg = .{ .index = 7 } });
     }
 
+    fn drawEntryLine(model: *Model, surface: *vxfw.Surface, allocator: mem.Allocator, entry_idx: usize, row: u16) mem.Allocator.Error!void {
+        const entry = model.entries[entry_idx];
+        const prefix = switch (entry.role) {
+            .summary => "[ROOT]",
+            else => if (entry.is_dir) "[DIR] " else "[FILE]",
+        };
+        var size_buf: [32]u8 = undefined;
+        const size_str = formatSize(&size_buf, entry.size);
+        const line = if (entry.is_dir) blk: {
+            const file_label = if (entry.file_count == 1) "file" else "files";
+            if (entry.name.len == 0) {
+                break :blk try std.fmt.allocPrint(allocator, "{s} {s:>10} {d:>8} {s}", .{ prefix, size_str, entry.file_count, file_label });
+            }
+            break :blk try std.fmt.allocPrint(allocator, "{s} {s:>10} {d:>8} {s} {s}", .{ prefix, size_str, entry.file_count, file_label, entry.name });
+        } else try std.fmt.allocPrint(allocator, "{s} {s:>10} {s}", .{ prefix, size_str, entry.name });
+
+        const is_selected = entry_idx == model.selected and isSelectableEntry(entry);
+        const style: vaxis.Style = if (is_selected) .{ .bg = .{ .index = 4 }, .fg = .{ .index = 15 } } else .{};
+        try writeText(surface, allocator, line, row, 0, style);
+    }
+
     pub fn draw(model: *Model, ctx: vxfw.DrawContext) mem.Allocator.Error!vxfw.Surface {
         const width = ctx.max.width orelse 80;
         const height = ctx.max.height orelse 24;
@@ -1597,30 +1887,20 @@ pub const Model = struct {
 
         const visible_rows = @as(usize, @intCast(height -| 4));
         model.ensureSelectionVisible(visible_rows);
-        const max_entries = @min(model.entries.len -| model.scroll_offset, visible_rows);
+
+        const sticky_rows = model.stickyRootRows(visible_rows);
+        if (sticky_rows > 0) {
+            try model.drawEntryLine(&surface, ctx.arena, 0, 2);
+        }
+
+        const scrollable_rows = visible_rows - sticky_rows;
+        const first_entry = model.firstScrollableEntryIndex();
+        const max_entries = @min(model.entries.len -| first_entry, scrollable_rows);
         model.last_visible_rows = max_entries;
         for (0..max_entries) |i| {
-            const entry_idx = model.scroll_offset + i;
-            const entry = model.entries[entry_idx];
-            const prefix = switch (entry.role) {
-                .summary => "[ROOT]",
-                else => if (entry.is_dir) "[DIR] " else "[FILE]",
-            };
-            var size_buf: [32]u8 = undefined;
-            const size_str = formatSize(&size_buf, entry.size);
-            const line = if (entry.is_dir) blk: {
-                const file_label = if (entry.file_count == 1) "file" else "files";
-                if (entry.name.len == 0) {
-                    break :blk try std.fmt.allocPrint(ctx.arena, "{s} {s:>10} {d:>8} {s}", .{ prefix, size_str, entry.file_count, file_label });
-                }
-                break :blk try std.fmt.allocPrint(ctx.arena, "{s} {s:>10} {d:>8} {s} {s}", .{ prefix, size_str, entry.file_count, file_label, entry.name });
-            } else try std.fmt.allocPrint(ctx.arena, "{s} {s:>10} {s}", .{ prefix, size_str, entry.name });
-
-            const row = @as(u16, @intCast(2 + i));
-            const is_selected = entry_idx == model.selected and isSelectableEntry(entry);
-            const style: vaxis.Style = if (is_selected) .{ .bg = .{ .index = 4 }, .fg = .{ .index = 15 } } else .{};
-
-            try writeText(&surface, ctx.arena, line, row, 0, style);
+            const entry_idx = first_entry + i;
+            const row = @as(u16, @intCast(2 + sticky_rows + i));
+            try model.drawEntryLine(&surface, ctx.arena, entry_idx, row);
         }
 
         const help = "up/down: navigate | Enter/Right: open/parent | Delete: del dir | Backspace/Left/Esc: go up";
@@ -1745,6 +2025,47 @@ test "backspace quits when at root" {
     try std.testing.expect(ctx.quit);
 }
 
+test "left arrow at root does not quit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const io = std.testing.io;
+    const model = try Model.init(io, arena.allocator(), ".");
+    defer model.deinit();
+
+    var ctx = testEventContext(arena.allocator(), io);
+    defer ctx.cmds.deinit(arena.allocator());
+
+    try model.handleEvent(&ctx, .{ .key_press = .{ .codepoint = vaxis.Key.left } });
+
+    try std.testing.expect(!ctx.quit);
+    try std.testing.expect(!ctx.redraw);
+    try std.testing.expect(model.parent == null);
+}
+
+test "left arrow navigates up when parent exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const io = std.testing.io;
+    const model = try Model.init(io, arena.allocator(), ".");
+    defer model.deinit();
+
+    const dir_idx = findFirstDirIndex(model) orelse return error.SkipZigTest;
+    model.selected = dir_idx;
+    try model.navigateInto();
+    try finishLoading(model, arena.allocator(), io);
+
+    var ctx = testEventContext(arena.allocator(), io);
+    defer ctx.cmds.deinit(arena.allocator());
+
+    try model.handleEvent(&ctx, .{ .key_press = .{ .codepoint = vaxis.Key.left } });
+
+    try std.testing.expect(model.parent == null);
+    try std.testing.expect(ctx.redraw);
+    try std.testing.expect(!ctx.quit);
+}
+
 test "enter on parent entry navigates up" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1792,6 +2113,33 @@ test "selection scrolling follows the viewport" {
     model.selected = 1;
     model.ensureSelectionVisible(3);
     try std.testing.expectEqual(@as(usize, 1), model.scroll_offset);
+}
+
+test "root summary stays sticky while long root list scrolls" {
+    var entries = [_]Model.Entry{
+        .{ .name = @constCast(""), .path = @constCast("/tmp/root"), .size = 100, .file_count = 5, .dir_count = 1, .is_dir = true, .role = .summary },
+        .{ .name = @constCast("a"), .path = null, .size = 10, .is_dir = true },
+        .{ .name = @constCast("b"), .path = null, .size = 9, .is_dir = true },
+        .{ .name = @constCast("c"), .path = null, .size = 8, .is_dir = true },
+        .{ .name = @constCast("d"), .path = null, .size = 7, .is_dir = true },
+        .{ .name = @constCast("e"), .path = null, .size = 6, .is_dir = true },
+    };
+    var model: Model = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .cwd = @constCast("/tmp/root"),
+        .entries = entries[0..],
+        .selected = 5,
+    };
+
+    model.ensureSelectionVisible(3);
+    model.last_visible_rows = 2;
+
+    try std.testing.expect(model.hasStickyRootSummary());
+    try std.testing.expectEqual(@as(usize, 4), model.firstScrollableEntryIndex());
+    try std.testing.expectEqual(@as(?usize, null), model.entryIndexForMouseRow(2));
+    try std.testing.expectEqual(@as(?usize, 4), model.entryIndexForMouseRow(3));
+    try std.testing.expect(model.firstScrollableEntryIndex() != 0);
 }
 
 test "directory size xattr round trip" {
@@ -2001,8 +2349,6 @@ test "delete walks parent chain and updates cached stats without a rescan" {
     try std.testing.expectEqual(remaining_size, model.entries[0].size);
     try std.testing.expectEqual(@as(u64, 1), model.entries[0].file_count);
 }
-
-
 
 test "uppercase Y confirms delete" {
     var tmp = std.testing.tmpDir(.{});
@@ -2466,7 +2812,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const model = try Model.initLoadingWithCache(init.io, allocator, config.cwd, config.cache_ttl_seconds);
+    const model = try Model.initLoadingWithOptions(init.io, allocator, config.cwd, .{
+        .cache_ttl_seconds = config.cache_ttl_seconds,
+        .refresh_cache = config.refresh_cache,
+        .parallel = config.parallel,
+        .num_threads = config.num_threads,
+    });
     defer model.deinit();
 
     var app: vxfw.App = try .init(init.io, allocator, init.environ_map, &.{});
@@ -2502,7 +2853,6 @@ test "parseArgs: full example" {
     try std.testing.expectEqualStrings("/home/user", config.cwd);
 }
 
-
 test "parseArgs: --refresh-cache" {
     const args = &[_][]const u8{ "zdu", "--no-tui", "--refresh-cache", "--cache-ttl", "1800", "/home/user" };
     const config = try parseArgs(args);
@@ -2521,6 +2871,16 @@ test "parseArgs: --parallel and --jobs" {
     try std.testing.expectEqualStrings("/home/user", config.cwd);
 }
 
+test "parseArgs: refresh cache parallel and jobs apply to TUI" {
+    const args = &[_][]const u8{ "zdu", "--refresh-cache", "--parallel", "--jobs", "3", "--cache-ttl", "1800", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(!config.no_tui);
+    try std.testing.expect(config.refresh_cache);
+    try std.testing.expect(config.parallel);
+    try std.testing.expectEqual(@as(usize, 3), config.num_threads);
+    try std.testing.expectEqual(@as(u64, 1800), config.cache_ttl_seconds);
+    try std.testing.expectEqualStrings("/home/user", config.cwd);
+}
 
 test "parseArgs: -j implies parallel" {
     const args = &[_][]const u8{ "zdu", "--no-tui", "-j", "4", "/home/user" };
@@ -2623,7 +2983,6 @@ fn zduTestSetRawDirSizeXattr(
     }
 }
 
-
 fn zduTestSetRawDirStatsXattr(
     path: []const u8,
     bytes: []const u8,
@@ -2723,7 +3082,6 @@ test "loading writes each nested directory cache with that directory's own size"
     try std.testing.expectEqual(@as(u64, 1), c_stats.dir_count);
 }
 
-
 test "scanRootStats refreshes v3 stats cache with file counts" {
     switch (builtin.os.tag) {
         .linux, .macos => {},
@@ -2736,7 +3094,7 @@ test "scanRootStats refreshes v3 stats cache with file counts" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "root/a");
-    try zduTestWriteFile(&tmp, "root/a/one.dat", &[_]u8{ 1 });
+    try zduTestWriteFile(&tmp, "root/a/one.dat", &[_]u8{1});
     try zduTestWriteFile(&tmp, "root/a/two.dat", &[_]u8{ 2, 3 });
 
     const root_path = try zduTestTmpPath(allocator, &tmp, "root");
@@ -2945,6 +3303,106 @@ test "parallel root scan matches serial stack scan" {
     try std.testing.expectEqual(serial.dir_count, parallel.dir_count);
     try std.testing.expectEqual(@as(u64, 4), parallel.file_count);
     try std.testing.expectEqual(@as(u64, 3), parallel.dir_count);
+}
+
+test "TUI refresh-cache parallel jobs scan entries" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root/a");
+    try tmp.dir.createDirPath(std.testing.io, "root/b");
+    try zduTestWriteFile(&tmp, "root/a/one.txt", "1");
+    try zduTestWriteFile(&tmp, "root/a/two.txt", "22");
+    try zduTestWriteFile(&tmp, "root/b/three.txt", "333");
+
+    const root_path = try zduTestTmpPath(allocator, &tmp, "root");
+    defer allocator.free(root_path);
+
+    const model = try Model.initLoadingWithOptions(std.testing.io, allocator, root_path, .{
+        .cache_ttl_seconds = 1800,
+        .refresh_cache = true,
+        .parallel = true,
+        .num_threads = 2,
+    });
+    defer model.deinit();
+
+    try std.testing.expect(model.loading == null);
+    try std.testing.expect(model.refresh_cache);
+    try std.testing.expect(model.parallel);
+    try std.testing.expectEqual(@as(usize, 2), model.num_threads);
+    try std.testing.expectEqual(Model.EntryRole.summary, model.entries[0].role);
+    try std.testing.expectEqual(@as(u64, 3), model.entries[0].file_count);
+    try std.testing.expectEqual(@as(u64, 3), model.entries[0].dir_count);
+
+    const a_idx = findEntryIndex(model, "a") orelse return error.SkipZigTest;
+    const b_idx = findEntryIndex(model, "b") orelse return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u64, 2), model.entries[a_idx].file_count);
+    try std.testing.expectEqual(@as(u64, 1), model.entries[a_idx].dir_count);
+    try std.testing.expectEqual(@as(u64, 1), model.entries[b_idx].file_count);
+    try std.testing.expectEqual(@as(u64, 1), model.entries[b_idx].dir_count);
+}
+
+test "TUI scan options propagate when navigating into child directories" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root/sub");
+    try zduTestWriteFile(&tmp, "root/sub/file.txt", "child");
+
+    const root_path = try zduTestTmpPath(allocator, &tmp, "root");
+    defer allocator.free(root_path);
+
+    const model = try Model.initLoadingWithOptions(std.testing.io, allocator, root_path, .{
+        .cache_ttl_seconds = 1800,
+        .refresh_cache = true,
+        .parallel = true,
+        .num_threads = 2,
+    });
+    defer model.deinit();
+
+    model.selected = findEntryIndex(model, "sub") orelse return error.SkipZigTest;
+    try model.navigateInto();
+
+    try std.testing.expect(model.parent != null);
+    try std.testing.expect(model.loading == null);
+    try std.testing.expect(model.refresh_cache);
+    try std.testing.expect(model.parallel);
+    try std.testing.expectEqual(@as(usize, 2), model.num_threads);
+    try std.testing.expectEqual(@as(u64, 1800), model.cache_ttl_seconds);
+}
+
+test "TUI refresh-cache serial loading ignores fresh stale child cache" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root/d");
+    try zduTestWriteFile(&tmp, "root/d/actual.txt", "actual");
+
+    const root_path = try zduTestTmpPath(allocator, &tmp, "root");
+    defer allocator.free(root_path);
+    const d_path = try zduTestTmpPath(allocator, &tmp, "root/d");
+    defer allocator.free(d_path);
+
+    Model.writeCachedDirStats(d_path, .{ .size = 999_999, .file_count = 99, .dir_count = 99 }, 1800, allocator);
+
+    const model = try Model.initLoadingWithOptions(std.testing.io, allocator, root_path, .{
+        .cache_ttl_seconds = 1800,
+        .refresh_cache = true,
+        .parallel = false,
+    });
+    defer model.deinit();
+    try finishLoading(model, allocator, std.testing.io);
+
+    const d_idx = findEntryIndex(model, "d") orelse return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u64, 1), model.entries[d_idx].file_count);
+    try std.testing.expectEqual(@as(u64, 1), model.entries[d_idx].dir_count);
+    try std.testing.expect(model.entries[d_idx].size != 999_999);
 }
 
 test "model does not process /proc" {
