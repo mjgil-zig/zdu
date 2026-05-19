@@ -62,24 +62,6 @@ For a little scheduling slack, set the TTL slightly longer than the cadence:
 */30 * * * * /usr/local/bin/zdu --no-tui --refresh-cache --cache-ttl 2100 /path/to/scan >/dev/null 2>&1
 ```
 
-A GitHub Actions schedule can do the same thing on a self-hosted runner that has access to the real filesystem and preserves xattrs:
-
-```yaml
-name: Warm zdu cache
-
-on:
-  schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch:
-
-jobs:
-  warm-cache:
-    runs-on: self-hosted
-    steps:
-      - name: Refresh zdu xattr cache
-        run: zdu --no-tui --refresh-cache --cache-ttl 1800 "$ZDU_SCAN_PATH"
-```
-
 ## Delete behavior
 
 Deleting a file or directory updates cached parent directory stats by subtracting the deleted entry's known `{size, file_count, dir_count}` while walking up the current navigation chain. It does not rescan or recompute children after the delete.
