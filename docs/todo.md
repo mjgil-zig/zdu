@@ -13,14 +13,14 @@
 
 ## Phase 2: Refactor & Deduplicate
 
-- [ ] **2.1 Extract Cache module from Model**
-  - [ ] Create `src/Cache.zig`
-  - [ ] Move `readCachedDirStats`, `readCachedDirStatsFd`, `writeCachedDirStats`, `writeCachedDirStatsFd`
-  - [ ] Move `encodeCachedDirStats`, `decodeCachedDirStats`, `encodeCachedDirSize`, `decodeCachedDirSize`
-  - [ ] Move `clearCachedDirStats`, `clearCachedDirSize`
-  - [ ] Move platform-specific xattr/ADS functions (`darwin_xattr`, `windows_ads`, etc.)
-  - [ ] Move `currentTimestampSeconds`, `cacheExpiresAt`
-  - [ ] Export a clean API: `Cache.read()`, `Cache.write()`, `Cache.clear()`
+- [x] **2.1 Extract Cache module from Model**
+  - [x] Create `src/Cache.zig`
+  - [x] Move `readCachedDirStats`, `readCachedDirStatsFd`, `writeCachedDirStats`, `writeCachedDirStatsFd`
+  - [x] Move `encodeCachedDirStats`, `decodeCachedDirStats`, `encodeCachedDirSize`, `decodeCachedDirSize`
+  - [x] Move `clearCachedDirStats`, `clearCachedDirSize`
+  - [x] Move platform-specific xattr/ADS functions (`darwin_xattr`, `windows_ads`, etc.)
+  - [x] Move `currentTimestampSeconds`, `cacheExpiresAt`
+  - [x] `main.zig` imports `Cache.zig` and uses `Cache.*` for all cache operations
 
 - [ ] **2.2 Extract Scan module from Model**
   - [ ] Create `src/Scan.zig`

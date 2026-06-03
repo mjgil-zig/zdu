@@ -3,6 +3,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const zdu = @import("zdu");
+const Cache = @import("Cache.zig");
 const mem = std.mem;
 
 const have_posix_stat = builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos);
@@ -151,26 +152,12 @@ pub const Model = struct {
 
     const loading_frames = [_][]const u8{ "|", "/", "-", "\\" };
     const loading_tick_ms: u32 = 16;
-    const dir_size_xattr_name: [:0]const u8 = "user.zdu.dir_size.v2";
-    const dir_stats_xattr_name: [:0]const u8 = "user.zdu.dir_stats.v3";
+    const dir_size_xattr_name = Cache.dir_size_xattr_name;
+    const dir_stats_xattr_name = Cache.dir_stats_xattr_name;
 
-    const CachedDirSize = struct {
-        size: u64,
-        expires_at: u64,
-    };
-
-    const CachedDirStats = struct {
-        size: u64,
-        file_count: u64,
-        dir_count: u64,
-        expires_at: u64,
-    };
-
-    const DirStats = struct {
-        size: u64 = 0,
-        file_count: u64 = 0,
-        dir_count: u64 = 0,
-    };
+    const CachedDirSize = Cache.CachedDirSize;
+    const CachedDirStats = Cache.CachedDirStats;
+    const DirStats = Cache.DirStats;
 
     pub const Options = struct {
         cache_ttl_seconds: u64 = 0,
@@ -394,7 +381,7 @@ pub const Model = struct {
     fn openChildDirForScan(parent_dir: std.Io.Dir, io: std.Io, name: []const u8, cache_ttl_seconds: u64, read_cache: bool) ?CachedOrOpenDir {
         var dir = parent_dir.openDir(io, name, .{ .iterate = true }) catch return null;
         if (read_cache and cache_ttl_seconds > 0) {
-            if (readCachedDirStatsFd(dir)) |cached_stats| {
+            if (Cache.readCachedDirStatsFd(dir)) |cached_stats| {
                 dir.close(io);
                 return .{ .cached_stats = cached_stats };
             }
@@ -539,7 +526,7 @@ pub const Model = struct {
                 model.allocator,
                 "..",
                 parent.cwd,
-                readCachedDirStats(parent.cwd, model.allocator) orelse .{},
+                Cache.readCachedDirStats(parent.cwd, model.allocator) orelse .{},
                 true,
                 .parent,
             ));
@@ -558,7 +545,7 @@ pub const Model = struct {
                     if (model.refresh_cache) {
                         break :blk computeDirStatsRefreshing(full_path, model.allocator, model.io, model.cache_ttl_seconds);
                     }
-                    break :blk readCachedDirStats(full_path, model.allocator) orelse .{};
+                    break :blk Cache.readCachedDirStats(full_path, model.allocator) orelse .{};
                 } else fileEntryStats(fileSizeOnDiskAt(dir, entry.name, model.io)),
                 .loading => blk: {
                     if (is_dir) {
@@ -727,7 +714,7 @@ pub const Model = struct {
             addStats(&frame.total, stats);
             ctx.allocator.destroy(future);
         }
-        writeCachedDirStatsFd(frame.dir, frame.total, ctx.cache_ttl_seconds);
+        Cache.writeCachedDirStatsFd(frame.dir, frame.total, ctx.cache_ttl_seconds);
         return frame.total;
     }
 
@@ -761,7 +748,7 @@ pub const Model = struct {
         };
 
         if (!ctx.refresh_cache and ctx.cache_ttl_seconds > 0) {
-            if (readCachedDirStatsFd(root_dir)) |cached_stats| {
+            if (Cache.readCachedDirStatsFd(root_dir)) |cached_stats| {
                 root_dir.close(ctx.io);
                 ctx.allocator.free(root_path);
                 return cached_stats;
@@ -791,7 +778,7 @@ pub const Model = struct {
                     continue;
                 }
 
-                const cached = if (ctx.cache_ttl_seconds > 0) readCachedDirStats(child_path, ctx.allocator) else null;
+                const cached = if (ctx.cache_ttl_seconds > 0) Cache.readCachedDirStats(child_path, ctx.allocator) else null;
                 if (!ctx.refresh_cache) {
                     if (cached) |cached_stats| {
                         addStats(&frame.total, cached_stats);
@@ -994,7 +981,7 @@ pub const Model = struct {
                 }
 
                 const cached = if (!model.refresh_cache and model.cache_ttl_seconds > 0)
-                    readCachedDirStats(full_path, model.allocator)
+                    Cache.readCachedDirStats(full_path, model.allocator)
                 else
                     null;
                 const stats = cached orelse DirStats{};
@@ -1012,7 +999,7 @@ pub const Model = struct {
                     try tasks.append(model.allocator, .{
                         .path = full_path,
                         .entry_index = entry_index,
-                        .estimate_files = if (readCachedDirStats(full_path, model.allocator)) |cached_stats| cached_stats.file_count else 0,
+                        .estimate_files = if (Cache.readCachedDirStats(full_path, model.allocator)) |cached_stats| cached_stats.file_count else 0,
                     });
                     owns_full_path = false;
                 } else {
@@ -1040,7 +1027,7 @@ pub const Model = struct {
             try prependRootSummary(model.allocator, &entries_list, model.cwd);
         }
 
-        writeCachedDirStatsFd(dir, currentDirStatsFromEntries(entries_list.items), model.cache_ttl_seconds);
+        Cache.writeCachedDirStatsFd(dir, currentDirStatsFromEntries(entries_list.items), model.cache_ttl_seconds);
         model.entries = try entries_list.toOwnedSlice(model.allocator);
         model.resetEntryView();
     }
@@ -1069,7 +1056,7 @@ pub const Model = struct {
             try prependRootSummary(model.allocator, &entries_list, model.cwd);
         }
 
-        writeCachedDirStatsFd(dir, currentDirStatsFromEntries(entries_list.items), model.cache_ttl_seconds);
+        Cache.writeCachedDirStatsFd(dir, currentDirStatsFromEntries(entries_list.items), model.cache_ttl_seconds);
         model.entries = try entries_list.toOwnedSlice(model.allocator);
         model.resetEntryView();
     }
@@ -1161,7 +1148,7 @@ pub const Model = struct {
             }
 
             const completed = loading.scan_stack.pop().?;
-            writeCachedDirStatsFd(completed.dir, completed.total, model.cache_ttl_seconds);
+            Cache.writeCachedDirStatsFd(completed.dir, completed.total, model.cache_ttl_seconds);
             completed.dir.close(model.io);
 
             if (loading.scan_stack.items.len > 0) {
@@ -1216,7 +1203,7 @@ pub const Model = struct {
             if (!cache_written and model.entries[entry_index].is_dir and model.entries[entry_index].role == .item) {
                 const full_path = try model.allocEntryPath(model.entries[entry_index]);
                 defer model.allocator.free(full_path);
-                writeCachedDirStats(full_path, stats, model.cache_ttl_seconds, model.allocator);
+                Cache.writeCachedDirStats(full_path, stats, model.cache_ttl_seconds, model.allocator);
             }
         }
         loading.processed += 1;
@@ -1233,9 +1220,9 @@ pub const Model = struct {
         model.allocator.free(model.entries);
         model.entries = updated;
         if (model.loading) |loading| {
-            writeCachedDirStatsFd(loading.root_dir, total_stats, model.cache_ttl_seconds);
+            Cache.writeCachedDirStatsFd(loading.root_dir, total_stats, model.cache_ttl_seconds);
         } else {
-            writeCachedDirStats(model.cwd, total_stats, model.cache_ttl_seconds, model.allocator);
+            Cache.writeCachedDirStats(model.cwd, total_stats, model.cache_ttl_seconds, model.allocator);
         }
     }
 
@@ -1335,7 +1322,7 @@ pub const Model = struct {
         if (zdu.isGeneratedDirPath(path)) return .{};
 
         if (read_cache and cache_ttl_seconds > 0) {
-            if (readCachedDirStats(path, allocator)) |cached_stats| {
+            if (Cache.readCachedDirStats(path, allocator)) |cached_stats| {
                 return cached_stats;
             }
         }
@@ -1348,7 +1335,7 @@ pub const Model = struct {
 
     fn computeDirStatsInDir(dir: std.Io.Dir, io: std.Io, cache_ttl_seconds: u64, read_cache: bool) DirStats {
         if (read_cache and cache_ttl_seconds > 0) {
-            if (readCachedDirStatsFd(dir)) |cached_stats| {
+            if (Cache.readCachedDirStatsFd(dir)) |cached_stats| {
                 return cached_stats;
             }
         }
@@ -1368,7 +1355,7 @@ pub const Model = struct {
                 }
             }
         }
-        writeCachedDirStatsFd(dir, total, cache_ttl_seconds);
+        Cache.writeCachedDirStatsFd(dir, total, cache_ttl_seconds);
         return total;
     }
 
@@ -1391,7 +1378,7 @@ pub const Model = struct {
 
         var root_dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return .{ .dir_count = 1 };
         if (read_cache and cache_ttl_seconds > 0) {
-            if (readCachedDirStatsFd(root_dir)) |cached_stats| {
+            if (Cache.readCachedDirStatsFd(root_dir)) |cached_stats| {
                 root_dir.close(io);
                 return cached_stats;
             }
@@ -1421,7 +1408,7 @@ pub const Model = struct {
             }
 
             const completed = stack.pop().?;
-            writeCachedDirStatsFd(completed.dir, completed.total, cache_ttl_seconds);
+            Cache.writeCachedDirStatsFd(completed.dir, completed.total, cache_ttl_seconds);
             completed.dir.close(io);
 
             if (stack.items.len > 0) {
@@ -1479,558 +1466,20 @@ pub const Model = struct {
     }
 
     fn readCachedDirSize(path: []const u8, allocator: mem.Allocator) ?u64 {
-        if (readCachedDirStats(path, allocator)) |stats| return stats.size;
+        if (Cache.readCachedDirStats(path, allocator)) |stats| return stats.size;
         return null;
     }
 
     fn readCachedDirSizeFd(dir: std.Io.Dir) ?u64 {
-        if (readCachedDirStatsFd(dir)) |stats| return stats.size;
+        if (Cache.readCachedDirStatsFd(dir)) |stats| return stats.size;
         return null;
-    }
-
-    const windows_max_path_wchars = 32768;
-    const windows_ads_path_extra_wchars = 128;
-
-    fn windowsPathNeedsDotPrefix(path: []const u8) bool {
-        if (path.len == 0) return false;
-        if (mem.eql(u8, path, ".") or mem.eql(u8, path, "..")) return false;
-        if (path[0] == '\\' or path[0] == '/') return false;
-        if (path.len >= 2 and path[1] == ':') return false;
-        return true;
-    }
-
-    fn windowsAllocAdsPath(allocator: mem.Allocator, path: []const u8, stream_name: [:0]const u8) ?[:0]u16 {
-        if (comptime builtin.os.tag != .windows) return null;
-
-        const prefix = if (windowsPathNeedsDotPrefix(path)) ".\\" else "";
-        const ads_path_utf8 = std.fmt.allocPrint(allocator, "{s}{s}:{s}:$DATA", .{ prefix, path, stream_name }) catch return null;
-        defer allocator.free(ads_path_utf8);
-
-        return std.unicode.utf8ToUtf16LeAllocZ(allocator, ads_path_utf8) catch return null;
-    }
-
-    fn windowsMakeAdsPathW(buf: []u16, base_path: []const u16, stream_name: [:0]const u8) ?[:0]u16 {
-        if (comptime builtin.os.tag != .windows) return null;
-
-        const stream_type = ":$DATA";
-        const needed = base_path.len + 1 + stream_name.len + stream_type.len + 1;
-        if (needed > buf.len) return null;
-
-        var idx: usize = 0;
-        @memcpy(buf[idx..][0..base_path.len], base_path);
-        idx += base_path.len;
-
-        buf[idx] = ':';
-        idx += 1;
-
-        for (stream_name) |ch| {
-            buf[idx] = ch;
-            idx += 1;
-        }
-
-        for (stream_type) |ch| {
-            buf[idx] = ch;
-            idx += 1;
-        }
-
-        buf[idx] = 0;
-        return buf[0..idx :0];
-    }
-
-    fn windowsStripVerbatimPrefix(path: []const u16) []const u16 {
-        const prefix = "\\\\?\\";
-        if (path.len > prefix.len and
-            path[0] == '\\' and path[1] == '\\' and
-            path[2] == '?' and path[3] == '\\')
-        {
-            const rest = path[prefix.len..];
-            // \\?\UNC\server\share -> \\server\share
-            if (rest.len > 4 and
-                (rest[0] == 'U' or rest[0] == 'u') and
-                (rest[1] == 'N' or rest[1] == 'n') and
-                (rest[2] == 'C' or rest[2] == 'c') and
-                rest[3] == '\\')
-            {
-                return path[prefix.len - 2 ..];
-            }
-            return rest;
-        }
-        return path;
-    }
-
-    fn windowsAdsPathFromDirHandle(dir: std.Io.Dir, stream_name: [:0]const u8, buf: []u16) ?[:0]u16 {
-        if (comptime builtin.os.tag != .windows) return null;
-
-        var path_buf: [windows_max_path_wchars]u16 = undefined;
-        const len_raw = windows_ads.GetFinalPathNameByHandleW(
-            dir.handle,
-            path_buf[0..].ptr,
-            @intCast(path_buf.len),
-            windows_ads.FILE_NAME_NORMALIZED | windows_ads.VOLUME_NAME_DOS,
-        );
-        if (len_raw == 0) return null;
-
-        const len: usize = @intCast(len_raw);
-        if (len >= path_buf.len) return null;
-
-        const normalized = windowsStripVerbatimPrefix(path_buf[0..len]);
-        return windowsMakeAdsPathW(buf, normalized, stream_name);
-    }
-
-    fn windowsReadAdsPathW(path_w: [*:0]const u16, buf: []u8) bool {
-        if (comptime builtin.os.tag != .windows) return false;
-
-        const handle = windows_ads.CreateFileW(
-            path_w,
-            windows_ads.GENERIC_READ,
-            windows_ads.share_all,
-            null,
-            windows_ads.OPEN_EXISTING,
-            windows_ads.FILE_FLAG_BACKUP_SEMANTICS,
-            null,
-        );
-        if (windows_ads.isInvalidHandle(handle)) return false;
-        defer _ = windows_ads.CloseHandle(handle);
-
-        var file_size: i64 = 0;
-        if (windows_ads.GetFileSizeEx(handle, &file_size) == 0) return false;
-        if (file_size < 0 or @as(u64, @intCast(file_size)) != buf.len) return false;
-
-        var bytes_read: windows_ads.DWORD = 0;
-        if (windows_ads.ReadFile(handle, buf.ptr, @intCast(buf.len), &bytes_read, null) == 0) return false;
-        return bytes_read == buf.len;
-    }
-
-    fn windowsWriteAdsPathW(path_w: [*:0]const u16, buf: []const u8) bool {
-        if (comptime builtin.os.tag != .windows) return false;
-
-        const handle = windows_ads.CreateFileW(
-            path_w,
-            windows_ads.GENERIC_WRITE,
-            windows_ads.share_all,
-            null,
-            windows_ads.CREATE_ALWAYS,
-            windows_ads.FILE_FLAG_BACKUP_SEMANTICS,
-            null,
-        );
-        if (windows_ads.isInvalidHandle(handle)) return false;
-        defer _ = windows_ads.CloseHandle(handle);
-
-        var bytes_written: windows_ads.DWORD = 0;
-        if (windows_ads.WriteFile(handle, buf.ptr, @intCast(buf.len), &bytes_written, null) == 0) return false;
-        return bytes_written == buf.len;
-    }
-
-    fn windowsDeleteAdsPathW(path_w: [*:0]const u16) void {
-        if (comptime builtin.os.tag != .windows) return;
-        _ = windows_ads.DeleteFileW(path_w);
-    }
-
-    fn windowsReadAds(path: []const u8, stream_name: [:0]const u8, buf: []u8, allocator: mem.Allocator) bool {
-        if (comptime builtin.os.tag != .windows) return false;
-
-        const ads_path = windowsAllocAdsPath(allocator, path, stream_name) orelse return false;
-        defer allocator.free(ads_path);
-        return windowsReadAdsPathW(ads_path.ptr, buf);
-    }
-
-    fn windowsReadAdsFd(dir: std.Io.Dir, stream_name: [:0]const u8, buf: []u8) bool {
-        if (comptime builtin.os.tag != .windows) return false;
-
-        var ads_buf: [windows_max_path_wchars + windows_ads_path_extra_wchars]u16 = undefined;
-        const ads_path = windowsAdsPathFromDirHandle(dir, stream_name, ads_buf[0..]) orelse return false;
-        return windowsReadAdsPathW(ads_path.ptr, buf);
-    }
-
-    fn windowsWriteAds(path: []const u8, stream_name: [:0]const u8, buf: []const u8, allocator: mem.Allocator) bool {
-        if (comptime builtin.os.tag != .windows) return false;
-
-        const ads_path = windowsAllocAdsPath(allocator, path, stream_name) orelse return false;
-        defer allocator.free(ads_path);
-        return windowsWriteAdsPathW(ads_path.ptr, buf);
-    }
-
-    fn windowsWriteAdsFd(dir: std.Io.Dir, stream_name: [:0]const u8, buf: []const u8) bool {
-        if (comptime builtin.os.tag != .windows) return false;
-
-        var ads_buf: [windows_max_path_wchars + windows_ads_path_extra_wchars]u16 = undefined;
-        const ads_path = windowsAdsPathFromDirHandle(dir, stream_name, ads_buf[0..]) orelse return false;
-        return windowsWriteAdsPathW(ads_path.ptr, buf);
-    }
-
-    fn windowsDeleteAds(path: []const u8, stream_name: [:0]const u8, allocator: mem.Allocator) void {
-        if (comptime builtin.os.tag != .windows) return;
-
-        const ads_path = windowsAllocAdsPath(allocator, path, stream_name) orelse return;
-        defer allocator.free(ads_path);
-        windowsDeleteAdsPathW(ads_path.ptr);
-    }
-
-    fn decodeCachedDirStatsBuf(buf: *const [32]u8, now: u64) ?DirStats {
-        const record = decodeCachedDirStats(buf);
-        if (record.expires_at < now) return null;
-        return .{
-            .size = record.size,
-            .file_count = record.file_count,
-            .dir_count = record.dir_count,
-        };
-    }
-
-    fn decodeCachedDirSizeBuf(buf: *const [16]u8, now: u64) ?DirStats {
-        const record = decodeCachedDirSize(buf);
-        if (record.expires_at < now) return null;
-        return .{ .size = record.size };
-    }
-
-    fn readCachedDirStatsV2Windows(path: []const u8, allocator: mem.Allocator, now: u64) ?DirStats {
-        var buf: [16]u8 = undefined;
-        if (!windowsReadAds(path, dir_size_xattr_name, buf[0..], allocator)) return null;
-        return decodeCachedDirSizeBuf(&buf, now);
-    }
-
-    fn readCachedDirStats(path: []const u8, allocator: mem.Allocator) ?DirStats {
-        const now = currentTimestampSeconds() orelse return null;
-        const path_z = allocator.dupeZ(u8, path) catch return null;
-        defer allocator.free(path_z);
-        var buf: [32]u8 = undefined;
-
-        switch (builtin.os.tag) {
-            .linux => {
-                const linux = std.os.linux;
-                const rc = linux.getxattr(path_z.ptr, dir_stats_xattr_name, buf[0..].ptr, buf.len);
-                switch (linux.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc != buf.len) return null;
-                        const record = decodeCachedDirStats(&buf);
-                        if (record.expires_at < now) return null;
-                        return .{
-                            .size = record.size,
-                            .file_count = record.file_count,
-                            .dir_count = record.dir_count,
-                        };
-                    },
-                    else => return readCachedDirStatsV2Z(path_z.ptr, now),
-                }
-            },
-            .macos => {
-                const rc = darwin_xattr.getxattr(path_z.ptr, dir_stats_xattr_name, buf[0..].ptr, buf.len, 0, 0);
-                switch (std.c.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc != buf.len) return null;
-                        const record = decodeCachedDirStats(&buf);
-                        if (record.expires_at < now) return null;
-                        return .{
-                            .size = record.size,
-                            .file_count = record.file_count,
-                            .dir_count = record.dir_count,
-                        };
-                    },
-                    else => return readCachedDirStatsV2Z(path_z.ptr, now),
-                }
-            },
-            .windows => {
-                if (windowsReadAds(path, dir_stats_xattr_name, buf[0..], allocator)) {
-                    return decodeCachedDirStatsBuf(&buf, now);
-                }
-                return readCachedDirStatsV2Windows(path, allocator, now);
-            },
-            else => return null,
-        }
-    }
-
-    fn readCachedDirStatsFd(dir: std.Io.Dir) ?DirStats {
-        const now = currentTimestampSeconds() orelse return null;
-        var buf: [32]u8 = undefined;
-
-        switch (builtin.os.tag) {
-            .linux => {
-                const linux = std.os.linux;
-                const rc = linux.fgetxattr(dir.handle, dir_stats_xattr_name, buf[0..].ptr, buf.len);
-                switch (linux.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc != buf.len) return null;
-                        const record = decodeCachedDirStats(&buf);
-                        if (record.expires_at < now) return null;
-                        return .{
-                            .size = record.size,
-                            .file_count = record.file_count,
-                            .dir_count = record.dir_count,
-                        };
-                    },
-                    else => return readCachedDirStatsV2Fd(dir, now),
-                }
-            },
-            .macos => {
-                const rc = darwin_xattr.fgetxattr(dir.handle, dir_stats_xattr_name, buf[0..].ptr, buf.len, 0, 0);
-                switch (std.c.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc != buf.len) return null;
-                        const record = decodeCachedDirStats(&buf);
-                        if (record.expires_at < now) return null;
-                        return .{
-                            .size = record.size,
-                            .file_count = record.file_count,
-                            .dir_count = record.dir_count,
-                        };
-                    },
-                    else => return readCachedDirStatsV2Fd(dir, now),
-                }
-            },
-            .windows => {
-                if (windowsReadAdsFd(dir, dir_stats_xattr_name, buf[0..])) {
-                    return decodeCachedDirStatsBuf(&buf, now);
-                }
-                return readCachedDirStatsV2Fd(dir, now);
-            },
-            else => return null,
-        }
-    }
-
-    fn readCachedDirStatsV2Z(path_z: [*:0]const u8, now: u64) ?DirStats {
-        var buf: [16]u8 = undefined;
-
-        switch (builtin.os.tag) {
-            .linux => {
-                const linux = std.os.linux;
-                const rc = linux.getxattr(path_z, dir_size_xattr_name, buf[0..].ptr, buf.len);
-                switch (linux.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc != buf.len) return null;
-                        const record = decodeCachedDirSize(&buf);
-                        if (record.expires_at < now) return null;
-                        return .{ .size = record.size };
-                    },
-                    .NODATA, .NOENT, .OPNOTSUPP, .RANGE => return null,
-                    else => return null,
-                }
-            },
-            .macos => {
-                const rc = darwin_xattr.getxattr(path_z, dir_size_xattr_name, buf[0..].ptr, buf.len, 0, 0);
-                switch (std.c.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc != buf.len) return null;
-                        const record = decodeCachedDirSize(&buf);
-                        if (record.expires_at < now) return null;
-                        return .{ .size = record.size };
-                    },
-                    .NOATTR, .NOENT, .OPNOTSUPP, .RANGE => return null,
-                    else => return null,
-                }
-            },
-            else => return null,
-        }
-    }
-
-    fn readCachedDirStatsV2Fd(dir: std.Io.Dir, now: u64) ?DirStats {
-        var buf: [16]u8 = undefined;
-
-        switch (builtin.os.tag) {
-            .linux => {
-                const linux = std.os.linux;
-                const rc = linux.fgetxattr(dir.handle, dir_size_xattr_name, buf[0..].ptr, buf.len);
-                switch (linux.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc != buf.len) return null;
-                        const record = decodeCachedDirSize(&buf);
-                        if (record.expires_at < now) return null;
-                        return .{ .size = record.size };
-                    },
-                    .NODATA, .NOENT, .OPNOTSUPP, .RANGE => return null,
-                    else => return null,
-                }
-            },
-            .macos => {
-                const rc = darwin_xattr.fgetxattr(dir.handle, dir_size_xattr_name, buf[0..].ptr, buf.len, 0, 0);
-                switch (std.c.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc != buf.len) return null;
-                        const record = decodeCachedDirSize(&buf);
-                        if (record.expires_at < now) return null;
-                        return .{ .size = record.size };
-                    },
-                    .NOATTR, .NOENT, .OPNOTSUPP, .RANGE => return null,
-                    else => return null,
-                }
-            },
-            .windows => {
-                if (!windowsReadAdsFd(dir, dir_size_xattr_name, buf[0..])) return null;
-                return decodeCachedDirSizeBuf(&buf, now);
-            },
-            else => return null,
-        }
-    }
-
-    fn writeCachedDirSize(path: []const u8, size: u64, cache_ttl_seconds: u64, allocator: mem.Allocator) void {
-        writeCachedDirStats(path, .{ .size = size }, cache_ttl_seconds, allocator);
-    }
-
-    fn writeCachedDirSizeFd(dir: std.Io.Dir, size: u64, cache_ttl_seconds: u64) void {
-        writeCachedDirStatsFd(dir, .{ .size = size }, cache_ttl_seconds);
-    }
-
-    fn writeCachedDirStats(path: []const u8, stats: DirStats, cache_ttl_seconds: u64, allocator: mem.Allocator) void {
-        const path_z = allocator.dupeZ(u8, path) catch return;
-        defer allocator.free(path_z);
-        const stats_buf = encodeCachedDirStatsForWrite(stats, cache_ttl_seconds) orelse return;
-        const size_buf = encodeCachedDirSizeForWrite(stats.size, cache_ttl_seconds) orelse return;
-
-        switch (builtin.os.tag) {
-            .linux => {
-                const linux = std.os.linux;
-                _ = linux.setxattr(path_z.ptr, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0);
-                _ = linux.setxattr(path_z.ptr, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0);
-            },
-            .macos => {
-                _ = darwin_xattr.setxattr(path_z.ptr, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0, 0);
-                _ = darwin_xattr.setxattr(path_z.ptr, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0, 0);
-            },
-            .windows => {
-                _ = windowsWriteAds(path, dir_stats_xattr_name, stats_buf[0..], allocator);
-                _ = windowsWriteAds(path, dir_size_xattr_name, size_buf[0..], allocator);
-            },
-            else => {},
-        }
-    }
-
-    fn writeCachedDirStatsFd(dir: std.Io.Dir, stats: DirStats, cache_ttl_seconds: u64) void {
-        const stats_buf = encodeCachedDirStatsForWrite(stats, cache_ttl_seconds) orelse return;
-        const size_buf = encodeCachedDirSizeForWrite(stats.size, cache_ttl_seconds) orelse return;
-
-        switch (builtin.os.tag) {
-            .linux => {
-                const linux = std.os.linux;
-                _ = linux.fsetxattr(dir.handle, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0);
-                _ = linux.fsetxattr(dir.handle, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0);
-            },
-            .macos => {
-                _ = darwin_xattr.fsetxattr(dir.handle, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0, 0);
-                _ = darwin_xattr.fsetxattr(dir.handle, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0, 0);
-            },
-            .windows => {
-                _ = windowsWriteAdsFd(dir, dir_stats_xattr_name, stats_buf[0..]);
-                _ = windowsWriteAdsFd(dir, dir_size_xattr_name, size_buf[0..]);
-            },
-            else => {},
-        }
-    }
-
-    fn currentTimestampSeconds() ?u64 {
-        switch (builtin.os.tag) {
-            .linux => {
-                const linux = std.os.linux;
-                var ts: linux.timespec = undefined;
-                switch (linux.errno(linux.clock_gettime(.REALTIME, &ts))) {
-                    .SUCCESS => {
-                        if (ts.sec < 0) return null;
-                        return @as(u64, @intCast(ts.sec));
-                    },
-                    else => return null,
-                }
-            },
-            .macos => {
-                const now = c_time.time(null);
-                if (now < 0) return null;
-                return @as(u64, @intCast(now));
-            },
-            .windows => {
-                var ft: std.os.windows.FILETIME = undefined;
-                windows_ads.GetSystemTimeAsFileTime(&ft);
-                const hns = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-                if (hns < 116444736000000000) return null;
-                return (hns - 116444736000000000) / 10000000;
-            },
-            else => return null,
-        }
-    }
-
-    fn cacheExpiresAt(cache_ttl_seconds: u64) ?u64 {
-        return if (cache_ttl_seconds == 0)
-            std.math.maxInt(u64)
-        else blk: {
-            const now = currentTimestampSeconds() orelse return null;
-            break :blk now + cache_ttl_seconds;
-        };
-    }
-
-    fn encodeCachedDirSizeForWrite(size: u64, cache_ttl_seconds: u64) ?[16]u8 {
-        var buf: [16]u8 = undefined;
-        encodeCachedDirSize(&buf, .{
-            .size = size,
-            .expires_at = cacheExpiresAt(cache_ttl_seconds) orelse return null,
-        });
-        return buf;
-    }
-
-    fn encodeCachedDirStatsForWrite(stats: DirStats, cache_ttl_seconds: u64) ?[32]u8 {
-        var buf: [32]u8 = undefined;
-        encodeCachedDirStats(&buf, .{
-            .size = stats.size,
-            .file_count = stats.file_count,
-            .dir_count = stats.dir_count,
-            .expires_at = cacheExpiresAt(cache_ttl_seconds) orelse return null,
-        });
-        return buf;
-    }
-
-    fn encodeCachedDirSize(buf: *[16]u8, record: CachedDirSize) void {
-        std.mem.writeInt(u64, buf[0..8], record.size, .little);
-        std.mem.writeInt(u64, buf[8..16], record.expires_at, .little);
-    }
-
-    fn decodeCachedDirSize(buf: *const [16]u8) CachedDirSize {
-        return .{
-            .size = std.mem.readInt(u64, buf[0..8], .little),
-            .expires_at = std.mem.readInt(u64, buf[8..16], .little),
-        };
-    }
-
-    fn encodeCachedDirStats(buf: *[32]u8, record: CachedDirStats) void {
-        std.mem.writeInt(u64, buf[0..8], record.size, .little);
-        std.mem.writeInt(u64, buf[8..16], record.file_count, .little);
-        std.mem.writeInt(u64, buf[16..24], record.dir_count, .little);
-        std.mem.writeInt(u64, buf[24..32], record.expires_at, .little);
-    }
-
-    fn decodeCachedDirStats(buf: *const [32]u8) CachedDirStats {
-        return .{
-            .size = std.mem.readInt(u64, buf[0..8], .little),
-            .file_count = std.mem.readInt(u64, buf[8..16], .little),
-            .dir_count = std.mem.readInt(u64, buf[16..24], .little),
-            .expires_at = std.mem.readInt(u64, buf[24..32], .little),
-        };
-    }
-
-    fn clearCachedDirSize(path: []const u8, allocator: mem.Allocator) void {
-        const path_z = allocator.dupeZ(u8, path) catch return;
-        defer allocator.free(path_z);
-
-        switch (builtin.os.tag) {
-            .linux => {
-                const linux = std.os.linux;
-                _ = linux.removexattr(path_z.ptr, dir_stats_xattr_name);
-                _ = linux.removexattr(path_z.ptr, dir_size_xattr_name);
-            },
-            .macos => {
-                _ = darwin_xattr.removexattr(path_z.ptr, dir_stats_xattr_name, 0);
-                _ = darwin_xattr.removexattr(path_z.ptr, dir_size_xattr_name, 0);
-            },
-            .windows => {
-                windowsDeleteAds(path, dir_stats_xattr_name, allocator);
-                windowsDeleteAds(path, dir_size_xattr_name, allocator);
-            },
-            else => {},
-        }
-    }
-
-    fn clearCachedDirStats(path: []const u8, allocator: mem.Allocator) void {
-        clearCachedDirSize(path, allocator);
     }
 
     fn knownDirStats(model: *Model) ?DirStats {
         if (model.entries.len > 0 and model.entries[0].role == .summary) {
             return statsFromEntry(model.entries[0]);
         }
-        return readCachedDirStats(model.cwd, model.allocator);
+        return Cache.readCachedDirStats(model.cwd, model.allocator);
     }
 
     fn updateEntryStats(entry: *Entry, stats: DirStats) void {
@@ -2084,7 +1533,7 @@ pub const Model = struct {
             if (maybe_current_stats) |current_stats| {
                 if (subtractStats(current_stats, deleted_stats)) |updated_stats| {
                     updateSummaryEntryStats(cursor, updated_stats);
-                    writeCachedDirStats(cursor.cwd, updated_stats, cursor.cache_ttl_seconds, cursor.allocator);
+                    Cache.writeCachedDirStats(cursor.cwd, updated_stats, cursor.cache_ttl_seconds, cursor.allocator);
                     if (child) |child_model| child_model.updateParentEntryStats(updated_stats);
                 }
             }
@@ -2795,23 +2244,23 @@ test "directory size xattr round trip" {
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(dir_path);
 
-    Model.writeCachedDirSize(dir_path, 1234, 60, std.testing.allocator);
+    Cache.writeCachedDirSize(dir_path, 1234, 60, std.testing.allocator);
     const cached = Model.readCachedDirSize(dir_path, std.testing.allocator);
 
     if (cached == null) return error.SkipZigTest;
     try std.testing.expectEqual(@as(?u64, 1234), cached);
 
-    Model.clearCachedDirSize(dir_path, std.testing.allocator);
+    Cache.clearCachedDirSize(dir_path, std.testing.allocator);
 }
 
 test "Windows ADS relative paths get explicit current-directory prefix" {
-    try std.testing.expect(Model.windowsPathNeedsDotPrefix("relative"));
-    try std.testing.expect(Model.windowsPathNeedsDotPrefix("relative\\path"));
-    try std.testing.expect(!Model.windowsPathNeedsDotPrefix("."));
-    try std.testing.expect(!Model.windowsPathNeedsDotPrefix(".."));
-    try std.testing.expect(!Model.windowsPathNeedsDotPrefix("C:\\absolute"));
-    try std.testing.expect(!Model.windowsPathNeedsDotPrefix("/absolute"));
-    try std.testing.expect(!Model.windowsPathNeedsDotPrefix("\\\\server\\share"));
+    try std.testing.expect(Cache.windowsPathNeedsDotPrefix("relative"));
+    try std.testing.expect(Cache.windowsPathNeedsDotPrefix("relative\\path"));
+    try std.testing.expect(!Cache.windowsPathNeedsDotPrefix("."));
+    try std.testing.expect(!Cache.windowsPathNeedsDotPrefix(".."));
+    try std.testing.expect(!Cache.windowsPathNeedsDotPrefix("C:\\absolute"));
+    try std.testing.expect(!Cache.windowsPathNeedsDotPrefix("/absolute"));
+    try std.testing.expect(!Cache.windowsPathNeedsDotPrefix("\\\\server\\share"));
 }
 
 test "Windows ADS path helper appends named data stream suffix" {
@@ -2822,7 +2271,7 @@ test "Windows ADS path helper appends named data stream suffix" {
     for (base_ascii, 0..) |ch, idx| base[idx] = ch;
 
     var buf: [256]u16 = undefined;
-    const ads_path = Model.windowsMakeAdsPathW(buf[0..], base[0..], Model.dir_stats_xattr_name) orelse return error.SkipZigTest;
+    const ads_path = Cache.windowsMakeAdsPathW(buf[0..], base[0..], Cache.dir_stats_xattr_name) orelse return error.SkipZigTest;
 
     try zduTestExpectUtf16AsciiEqual(
         "C:\\tmp\\zdu-dir:user.zdu.dir_stats.v3:$DATA",
@@ -2843,12 +2292,12 @@ test "Windows ADS cache round trip works by path and directory handle" {
     const root_path = try zduTestTmpPath(allocator, &tmp, "root");
     defer allocator.free(root_path);
 
-    Model.clearCachedDirStats(root_path, allocator);
+    Cache.clearCachedDirStats(root_path, allocator);
 
     const written: Model.DirStats = .{ .size = 4321, .file_count = 7, .dir_count = 3 };
-    Model.writeCachedDirStats(root_path, written, 60, allocator);
+    Cache.writeCachedDirStats(root_path, written, 60, allocator);
 
-    const by_path = Model.readCachedDirStats(root_path, allocator) orelse return error.SkipZigTest;
+    const by_path = Cache.readCachedDirStats(root_path, allocator) orelse return error.SkipZigTest;
     try std.testing.expectEqual(written.size, by_path.size);
     try std.testing.expectEqual(written.file_count, by_path.file_count);
     try std.testing.expectEqual(written.dir_count, by_path.dir_count);
@@ -2856,13 +2305,13 @@ test "Windows ADS cache round trip works by path and directory handle" {
     var dir = std.Io.Dir.cwd().openDir(std.testing.io, root_path, .{ .iterate = true }) catch return error.SkipZigTest;
     defer dir.close(std.testing.io);
 
-    const by_handle = Model.readCachedDirStatsFd(dir) orelse return error.SkipZigTest;
+    const by_handle = Cache.readCachedDirStatsFd(dir) orelse return error.SkipZigTest;
     try std.testing.expectEqual(written.size, by_handle.size);
     try std.testing.expectEqual(written.file_count, by_handle.file_count);
     try std.testing.expectEqual(written.dir_count, by_handle.dir_count);
 
-    Model.clearCachedDirStats(root_path, allocator);
-    try std.testing.expect(Model.readCachedDirStats(root_path, allocator) == null);
+    Cache.clearCachedDirStats(root_path, allocator);
+    try std.testing.expect(Cache.readCachedDirStats(root_path, allocator) == null);
 }
 
 test "Windows ADS cache falls back to legacy v2 size stream" {
@@ -2878,15 +2327,15 @@ test "Windows ADS cache falls back to legacy v2 size stream" {
     const root_path = try zduTestTmpPath(allocator, &tmp, "root");
     defer allocator.free(root_path);
 
-    const now = Model.currentTimestampSeconds() orelse return error.SkipZigTest;
+    const now = Cache.currentTimestampSeconds() orelse return error.SkipZigTest;
 
     var legacy_record: [16]u8 = undefined;
     zduTestEncodeCacheRecord(&legacy_record, 9876, now + 60);
 
-    Model.clearCachedDirStats(root_path, allocator);
-    if (!Model.windowsWriteAds(root_path, Model.dir_size_xattr_name, legacy_record[0..], allocator)) return error.SkipZigTest;
+    Cache.clearCachedDirStats(root_path, allocator);
+    if (!Cache.windowsWriteAds(root_path, Cache.dir_size_xattr_name, legacy_record[0..], allocator)) return error.SkipZigTest;
 
-    const cached = Model.readCachedDirStats(root_path, allocator) orelse return error.TestUnexpectedResult;
+    const cached = Cache.readCachedDirStats(root_path, allocator) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 9876), cached.size);
     try std.testing.expectEqual(@as(u64, 0), cached.file_count);
     try std.testing.expectEqual(@as(u64, 0), cached.dir_count);
@@ -2905,13 +2354,13 @@ test "Windows ADS cache rejects wrong-length stats stream" {
     const root_path = try zduTestTmpPath(allocator, &tmp, "root");
     defer allocator.free(root_path);
 
-    Model.clearCachedDirStats(root_path, allocator);
+    Cache.clearCachedDirStats(root_path, allocator);
 
     var malformed_record: [31]u8 = undefined;
     @memset(malformed_record[0..], 0xaa);
-    if (!Model.windowsWriteAds(root_path, Model.dir_stats_xattr_name, malformed_record[0..], allocator)) return error.SkipZigTest;
+    if (!Cache.windowsWriteAds(root_path, Cache.dir_stats_xattr_name, malformed_record[0..], allocator)) return error.SkipZigTest;
 
-    try std.testing.expect(Model.readCachedDirStats(root_path, allocator) == null);
+    try std.testing.expect(Cache.readCachedDirStats(root_path, allocator) == null);
 }
 
 test "mouse clicks outside the visible list are ignored" {
@@ -3143,7 +2592,7 @@ test "delete propagation skips missing cache instead of recomputing" {
     const root_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root_path);
 
-    Model.clearCachedDirStats(root_path, std.testing.allocator);
+    Cache.clearCachedDirStats(root_path, std.testing.allocator);
 
     var model: Model = .{
         .io = std.testing.io,
@@ -3152,7 +2601,7 @@ test "delete propagation skips missing cache instead of recomputing" {
     };
 
     model.propagateDeletedStats(.{ .size = 1, .file_count = 1 }, root_path);
-    try std.testing.expect(Model.readCachedDirStats(root_path, std.testing.allocator) == null);
+    try std.testing.expect(Cache.readCachedDirStats(root_path, std.testing.allocator) == null);
 }
 
 test "delete propagation skips stale undersized cache" {
@@ -3164,7 +2613,7 @@ test "delete propagation skips stale undersized cache" {
     const root_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root_path);
 
-    Model.writeCachedDirStats(root_path, .{ .size = 1, .file_count = 1, .dir_count = 1 }, 60, std.testing.allocator);
+    Cache.writeCachedDirStats(root_path, .{ .size = 1, .file_count = 1, .dir_count = 1 }, 60, std.testing.allocator);
 
     var model: Model = .{
         .io = std.testing.io,
@@ -3195,8 +2644,8 @@ test "delete delta updates cached ancestors by walking the model chain" {
     const deleted_path = try std.fs.path.join(std.testing.allocator, &.{ child_path, "victim.txt" });
     defer std.testing.allocator.free(deleted_path);
 
-    Model.writeCachedDirStats(root_path, .{ .size = 100, .file_count = 3, .dir_count = 2 }, 60, std.testing.allocator);
-    Model.writeCachedDirStats(child_path, .{ .size = 70, .file_count = 2, .dir_count = 1 }, 60, std.testing.allocator);
+    Cache.writeCachedDirStats(root_path, .{ .size = 100, .file_count = 3, .dir_count = 2 }, 60, std.testing.allocator);
+    Cache.writeCachedDirStats(child_path, .{ .size = 70, .file_count = 2, .dir_count = 1 }, 60, std.testing.allocator);
 
     var parent_entries = [_]Model.Entry{
         .{ .name = @constCast(""), .path = root_path, .size = 100, .file_count = 3, .dir_count = 2, .is_dir = true, .role = .summary },
@@ -3373,7 +2822,7 @@ fn scanRootStatsMode(io: std.Io, allocator: mem.Allocator, cwd: []const u8, opts
                 allocator.free(full_path);
                 continue;
             }
-            const estimate_files = if (Model.readCachedDirStats(full_path, allocator)) |cached_stats| cached_stats.file_count else 0;
+            const estimate_files = if (Cache.readCachedDirStats(full_path, allocator)) |cached_stats| cached_stats.file_count else 0;
             try tasks.append(allocator, .{
                 .path = full_path,
                 .estimate_files = estimate_files,
@@ -3419,7 +2868,7 @@ fn scanRootStatsMode(io: std.Io, allocator: mem.Allocator, cwd: []const u8, opts
         }
     }
 
-    Model.writeCachedDirStats(cwd, root_stats, opts.cache_ttl_seconds, allocator);
+    Cache.writeCachedDirStats(cwd, root_stats, opts.cache_ttl_seconds, allocator);
     return root_stats;
 }
 
@@ -3876,7 +3325,7 @@ fn zduTestRequireCachedSize(path: []const u8, allocator: mem.Allocator) !u64 {
 }
 
 fn zduTestRequireCachedStats(path: []const u8, allocator: mem.Allocator) !Model.DirStats {
-    return Model.readCachedDirStats(path, allocator) orelse error.TestUnexpectedResult;
+    return Cache.readCachedDirStats(path, allocator) orelse error.TestUnexpectedResult;
 }
 
 fn zduTestEncodeCacheRecord(buf: *[16]u8, size: u64, expires_at: u64) void {
@@ -3896,7 +3345,7 @@ fn zduTestSetRawDirSizeXattr(
     bytes: []const u8,
     allocator: mem.Allocator,
 ) !void {
-    Model.clearCachedDirStats(path, allocator);
+    Cache.clearCachedDirStats(path, allocator);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
@@ -3904,7 +3353,7 @@ fn zduTestSetRawDirSizeXattr(
         .linux => {
             const rc = std.os.linux.setxattr(
                 path_z.ptr,
-                Model.dir_size_xattr_name,
+                Cache.dir_size_xattr_name,
                 bytes.ptr,
                 bytes.len,
                 0,
@@ -3914,7 +3363,7 @@ fn zduTestSetRawDirSizeXattr(
         .macos => {
             const rc = darwin_xattr.setxattr(
                 path_z.ptr,
-                Model.dir_size_xattr_name,
+                Cache.dir_size_xattr_name,
                 bytes.ptr,
                 bytes.len,
                 0,
@@ -3923,7 +3372,7 @@ fn zduTestSetRawDirSizeXattr(
             if (std.c.errno(rc) != .SUCCESS) return error.SkipZigTest;
         },
         .windows => {
-            if (!Model.windowsWriteAds(path, Model.dir_size_xattr_name, bytes, allocator)) return error.SkipZigTest;
+            if (!Cache.windowsWriteAds(path, Cache.dir_size_xattr_name, bytes, allocator)) return error.SkipZigTest;
         },
         else => return error.SkipZigTest,
     }
@@ -3934,7 +3383,7 @@ fn zduTestSetRawDirStatsXattr(
     bytes: []const u8,
     allocator: mem.Allocator,
 ) !void {
-    Model.clearCachedDirStats(path, allocator);
+    Cache.clearCachedDirStats(path, allocator);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
@@ -3942,7 +3391,7 @@ fn zduTestSetRawDirStatsXattr(
         .linux => {
             const rc = std.os.linux.setxattr(
                 path_z.ptr,
-                Model.dir_stats_xattr_name,
+                Cache.dir_stats_xattr_name,
                 bytes.ptr,
                 bytes.len,
                 0,
@@ -3952,7 +3401,7 @@ fn zduTestSetRawDirStatsXattr(
         .macos => {
             const rc = darwin_xattr.setxattr(
                 path_z.ptr,
-                Model.dir_stats_xattr_name,
+                Cache.dir_stats_xattr_name,
                 bytes.ptr,
                 bytes.len,
                 0,
@@ -3961,7 +3410,7 @@ fn zduTestSetRawDirStatsXattr(
             if (std.c.errno(rc) != .SUCCESS) return error.SkipZigTest;
         },
         .windows => {
-            if (!Model.windowsWriteAds(path, Model.dir_stats_xattr_name, bytes, allocator)) return error.SkipZigTest;
+            if (!Cache.windowsWriteAds(path, Cache.dir_stats_xattr_name, bytes, allocator)) return error.SkipZigTest;
         },
         else => return error.SkipZigTest,
     }
@@ -3999,9 +3448,9 @@ test "loading writes each nested directory cache with that directory's own size"
     const c_path = try zduTestTmpPath(allocator, &tmp, "root/a/c");
     defer allocator.free(c_path);
 
-    Model.clearCachedDirSize(a_path, allocator);
-    Model.clearCachedDirSize(b_path, allocator);
-    Model.clearCachedDirSize(c_path, allocator);
+    Cache.clearCachedDirSize(a_path, allocator);
+    Cache.clearCachedDirSize(b_path, allocator);
+    Cache.clearCachedDirSize(c_path, allocator);
 
     var model = try Model.initLoadingWithCache(std.testing.io, allocator, root_path, 0);
     defer model.deinit();
@@ -4051,8 +3500,8 @@ test "scanRootStats refreshes v3 stats cache with file counts" {
     const a_path = try zduTestTmpPath(allocator, &tmp, "root/a");
     defer allocator.free(a_path);
 
-    Model.clearCachedDirSize(root_path, allocator);
-    Model.clearCachedDirSize(a_path, allocator);
+    Cache.clearCachedDirSize(root_path, allocator);
+    Cache.clearCachedDirSize(a_path, allocator);
 
     const stats = try scanRootStats(std.testing.io, allocator, root_path, .{
         .cache_ttl_seconds = 1800,
@@ -4087,12 +3536,12 @@ test "dir stats xattr cache stores file counts and rejects expired or malformed 
     const dir_path = try zduTestTmpPath(allocator, &tmp, "root/d");
     defer allocator.free(dir_path);
 
-    Model.clearCachedDirSize(dir_path, allocator);
+    Cache.clearCachedDirSize(dir_path, allocator);
 
     const written_stats: Model.DirStats = .{ .size = 1234, .file_count = 9, .dir_count = 2 };
-    Model.writeCachedDirStats(dir_path, written_stats, 60, allocator);
+    Cache.writeCachedDirStats(dir_path, written_stats, 60, allocator);
 
-    const fresh = Model.readCachedDirStats(dir_path, allocator) orelse return error.SkipZigTest;
+    const fresh = Cache.readCachedDirStats(dir_path, allocator) orelse return error.SkipZigTest;
     try std.testing.expectEqual(written_stats.size, fresh.size);
     try std.testing.expectEqual(written_stats.file_count, fresh.file_count);
     try std.testing.expectEqual(written_stats.dir_count, fresh.dir_count);
@@ -4100,12 +3549,12 @@ test "dir stats xattr cache stores file counts and rejects expired or malformed 
     var dir = std.Io.Dir.cwd().openDir(std.testing.io, dir_path, .{ .iterate = true }) catch return error.SkipZigTest;
     defer dir.close(std.testing.io);
 
-    const fresh_fd = Model.readCachedDirStatsFd(dir) orelse return error.SkipZigTest;
+    const fresh_fd = Cache.readCachedDirStatsFd(dir) orelse return error.SkipZigTest;
     try std.testing.expectEqual(written_stats.size, fresh_fd.size);
     try std.testing.expectEqual(written_stats.file_count, fresh_fd.file_count);
     try std.testing.expectEqual(written_stats.dir_count, fresh_fd.dir_count);
 
-    const now = Model.currentTimestampSeconds() orelse return error.SkipZigTest;
+    const now = Cache.currentTimestampSeconds() orelse return error.SkipZigTest;
 
     var expired_record: [32]u8 = undefined;
     zduTestEncodeStatsCacheRecord(
@@ -4115,13 +3564,13 @@ test "dir stats xattr cache stores file counts and rejects expired or malformed 
     );
 
     try zduTestSetRawDirStatsXattr(dir_path, expired_record[0..], allocator);
-    try std.testing.expect(Model.readCachedDirStats(dir_path, allocator) == null);
+    try std.testing.expect(Cache.readCachedDirStats(dir_path, allocator) == null);
 
     var malformed_record: [31]u8 = undefined;
     @memset(malformed_record[0..], 0xaa);
 
     try zduTestSetRawDirStatsXattr(dir_path, malformed_record[0..], allocator);
-    try std.testing.expect(Model.readCachedDirStats(dir_path, allocator) == null);
+    try std.testing.expect(Cache.readCachedDirStats(dir_path, allocator) == null);
 
     var legacy_record: [16]u8 = undefined;
     zduTestEncodeCacheRecord(
@@ -4131,7 +3580,7 @@ test "dir stats xattr cache stores file counts and rejects expired or malformed 
     );
 
     try zduTestSetRawDirSizeXattr(dir_path, legacy_record[0..], allocator);
-    const legacy = Model.readCachedDirStats(dir_path, allocator) orelse return error.SkipZigTest;
+    const legacy = Cache.readCachedDirStats(dir_path, allocator) orelse return error.SkipZigTest;
     try std.testing.expectEqual(@as(u64, 7777), legacy.size);
     try std.testing.expectEqual(@as(u64, 0), legacy.file_count);
     try std.testing.expectEqual(@as(u64, 0), legacy.dir_count);
@@ -4156,7 +3605,7 @@ test "expired dir size cache is recomputed and refreshed" {
     const dir_path = try zduTestTmpPath(allocator, &tmp, "root/d");
     defer allocator.free(dir_path);
 
-    const now = Model.currentTimestampSeconds() orelse return error.SkipZigTest;
+    const now = Cache.currentTimestampSeconds() orelse return error.SkipZigTest;
 
     var expired_record: [16]u8 = undefined;
     zduTestEncodeCacheRecord(
@@ -4199,7 +3648,7 @@ test "refresh cache ignores a still-fresh stats record" {
     defer allocator.free(dir_path);
 
     const stale: Model.DirStats = .{ .size = 999_999, .file_count = 99, .dir_count = 99 };
-    Model.writeCachedDirStats(dir_path, stale, 1800, allocator);
+    Cache.writeCachedDirStats(dir_path, stale, 1800, allocator);
 
     const refreshed = Model.computeDirStatsRefreshing(dir_path, allocator, std.testing.io, 1800);
     try std.testing.expect(refreshed.size != stale.size);
@@ -4278,8 +3727,8 @@ test "dynamic parallel scan splits nested children and waits before parent cache
     const b_path = try zduTestTmpPath(allocator, &tmp, "root/huge/b");
     defer allocator.free(b_path);
 
-    Model.writeCachedDirStats(a_path, .{ .size = 999_999, .file_count = Model.dynamic_split_min_files, .dir_count = 1 }, 1800, allocator);
-    Model.writeCachedDirStats(b_path, .{ .size = 888_888, .file_count = Model.dynamic_split_min_files, .dir_count = 1 }, 1800, allocator);
+    Cache.writeCachedDirStats(a_path, .{ .size = 999_999, .file_count = Model.dynamic_split_min_files, .dir_count = 1 }, 1800, allocator);
+    Cache.writeCachedDirStats(b_path, .{ .size = 888_888, .file_count = Model.dynamic_split_min_files, .dir_count = 1 }, 1800, allocator);
 
     const inputs = [_]Model.DynamicScanInput{
         .{ .path = huge_path, .estimate_files = Model.dynamic_split_min_files * 2 },
@@ -4401,7 +3850,7 @@ test "TUI refresh-cache serial loading ignores fresh stale child cache" {
     const d_path = try zduTestTmpPath(allocator, &tmp, "root/d");
     defer allocator.free(d_path);
 
-    Model.writeCachedDirStats(d_path, .{ .size = 999_999, .file_count = 99, .dir_count = 99 }, 1800, allocator);
+    Cache.writeCachedDirStats(d_path, .{ .size = 999_999, .file_count = 99, .dir_count = 99 }, 1800, allocator);
 
     const model = try Model.initLoadingWithOptions(std.testing.io, allocator, root_path, .{
         .cache_ttl_seconds = 1800,
