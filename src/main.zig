@@ -2289,6 +2289,11 @@ pub const Model = struct {
                         ctx.redraw = true;
                         return;
                     }
+                    if (key.codepoint == vaxis.Key.escape) {
+                        model.cancelDelete();
+                        ctx.redraw = true;
+                        return;
+                    }
                     return;
                 }
 
@@ -2519,7 +2524,7 @@ pub const Model = struct {
             try model.drawEntryLine(&surface, ctx.arena, entry_idx, row);
         }
 
-        const help = "up/down: navigate | Enter/Right: open/parent | Delete: del dir | Backspace/Left/Esc: go up";
+        const help = "up/down: navigate | Enter/Right: open/del | Delete: del dir | Backspace/Left/Esc: go up | q: quit";
         try writeText(&surface, ctx.arena, help, height -| 1, 0, .{ .fg = .{ .index = 8 } });
 
         if (model.confirm_delete) |confirm| {

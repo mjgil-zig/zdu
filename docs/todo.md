@@ -73,21 +73,18 @@
 
 ## Phase 4: Fix UX Issues
 
-- [ ] **4.1 Require confirmation before deleting files**
-  - [ ] Currently Enter on a file immediately calls `deleteSelected()` + confirm dialog
-  - [ ] Ensure file deletion also shows the `[Y/n]` confirmation dialog
-  - [ ] Check if this is already the case; if so, document it clearly in help text
+- [x] **4.1 Require confirmation before deleting files**
+  - [x] Verified: all delete paths (Enter on file, left-click on file, right-click on dir, Delete key on dir) already go through `deleteSelected()` which opens the `[Y/n]` confirmation dialog
 
-- [ ] **4.2 Add Escape key support for canceling delete confirmation**
-  - [ ] In `handleEvent`, map `vaxis.Key.escape` during `confirm_delete != null` to `cancelDelete()`
+- [x] **4.2 Add Escape key support for canceling delete confirmation**
+  - [x] In `handleEvent`, map `vaxis.Key.escape` during `confirm_delete != null` to `cancelDelete()`
 
-- [ ] **4.3 Fix right-click mouse behavior on directories**
-  - [ ] Currently right-click immediately deletes a directory without confirmation
-  - [ ] Change to trigger `deleteSelected()` (which opens confirmation dialog) instead of direct delete
+- [x] **4.3 Fix right-click mouse behavior on directories**
+  - [x] Verified: right-click already calls `deleteSelected()`, which opens confirmation dialog
 
-- [ ] **4.4 Update TUI help bar text**
-  - [ ] Clarify that Enter on files triggers delete
-  - [ ] Add hint for `q` to quit
+- [x] **4.4 Update TUI help bar text**
+  - [x] Clarified that Enter/Right on files triggers delete
+  - [x] Added `q: quit` hint
 
 ## Phase 5: Library API Improvements
 
