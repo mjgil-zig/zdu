@@ -3456,6 +3456,8 @@ fn runNoTui(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_sec
     try stdout.flush();
 }
 
+const version = "0.1.0";
+
 const Config = struct {
     cwd: []const u8 = ".",
     cache_ttl_seconds: u64 = 0,
@@ -3464,14 +3466,45 @@ const Config = struct {
     num_threads: usize = 0,
     bench: bool = false,
     no_tui: bool = false,
+    help: bool = false,
+    version: bool = false,
 };
+
+fn printHelp(writer: anytype) !void {
+    try writer.writeAll(
+        \\Usage: zdu [options] [path]
+        \\
+        \\Options:
+        \\  -h, --help              Show this help message and exit
+        \\  -v, --version           Show version and exit
+        \\  --no-tui                Print total size and exit (no interactive UI)
+        \\  --cache-ttl [seconds]   Trust cached stats within TTL (default 60s if no value)
+        \\  --refresh-cache         Recompute and rewrite cache entries
+        \\  --parallel              Enable parallel directory scanning
+        \\  --jobs, -j <n>          Number of parallel workers (implies --parallel)
+        \\  --bench                 Run benchmark and exit
+        \\
+        \\Examples:
+        \\  zdu
+        \\  zdu /home/user/git
+        \\  zdu --no-tui /home/user/git
+        \\  zdu --cache-ttl 300 /home/user/git
+        \\  zdu --no-tui --refresh-cache --cache-ttl 1800 /path/to/scan
+        \\  zdu --parallel --jobs 8 --refresh-cache --cache-ttl 1800 /path/to/scan
+        \\
+    );
+}
 
 fn parseArgs(args: []const []const u8) !Config {
     var config = Config{};
     var idx: usize = 1;
     while (idx < args.len) : (idx += 1) {
         const arg = args[idx];
-        if (mem.eql(u8, arg, "--cache-ttl")) {
+        if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
+            config.help = true;
+        } else if (mem.eql(u8, arg, "-v") or mem.eql(u8, arg, "--version")) {
+            config.version = true;
+        } else if (mem.eql(u8, arg, "--cache-ttl")) {
             if (idx + 1 < args.len) {
                 const next_arg = args[idx + 1];
                 if (std.fmt.parseInt(u64, next_arg, 10)) |val| {
@@ -3519,6 +3552,24 @@ pub fn main(init: std.process.Init) !void {
 
     const config = try parseArgs(args);
 
+    if (config.help) {
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+        const stdout = &stdout_writer.interface;
+        try printHelp(stdout);
+        try stdout.flush();
+        return;
+    }
+
+    if (config.version) {
+        var stdout_buffer: [64]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+        const stdout = &stdout_writer.interface;
+        try stdout.print("zdu {s}\n", .{version});
+        try stdout.flush();
+        return;
+    }
+
     if (config.bench) {
         try runBenchmarks(init.io, allocator, config.cwd, config.cache_ttl_seconds);
         return;
@@ -3540,6 +3591,30 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit();
 
     try app.run(model.widget(), .{});
+}
+
+test "parseArgs: --help" {
+    const args = &[_][]const u8{ "zdu", "--help" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.help);
+}
+
+test "parseArgs: -h" {
+    const args = &[_][]const u8{ "zdu", "-h" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.help);
+}
+
+test "parseArgs: --version" {
+    const args = &[_][]const u8{ "zdu", "--version" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.version);
+}
+
+test "parseArgs: -v" {
+    const args = &[_][]const u8{ "zdu", "-v" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.version);
 }
 
 test "parseArgs: --cache-ttl defaults to 60s" {
