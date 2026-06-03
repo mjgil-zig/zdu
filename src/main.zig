@@ -1537,6 +1537,27 @@ pub const Model = struct {
         return buf[0..idx :0];
     }
 
+    fn windowsStripVerbatimPrefix(path: []const u16) []const u16 {
+        const prefix = "\\\\?\\";
+        if (path.len > prefix.len and
+            path[0] == '\\' and path[1] == '\\' and
+            path[2] == '?' and path[3] == '\\')
+        {
+            const rest = path[prefix.len..];
+            // \\?\UNC\server\share -> \\server\share
+            if (rest.len > 4 and
+                (rest[0] == 'U' or rest[0] == 'u') and
+                (rest[1] == 'N' or rest[1] == 'n') and
+                (rest[2] == 'C' or rest[2] == 'c') and
+                rest[3] == '\\')
+            {
+                return path[prefix.len - 2 ..];
+            }
+            return rest;
+        }
+        return path;
+    }
+
     fn windowsAdsPathFromDirHandle(dir: std.Io.Dir, stream_name: [:0]const u8, buf: []u16) ?[:0]u16 {
         if (comptime builtin.os.tag != .windows) return null;
 
@@ -1552,7 +1573,8 @@ pub const Model = struct {
         const len: usize = @intCast(len_raw);
         if (len >= path_buf.len) return null;
 
-        return windowsMakeAdsPathW(buf, path_buf[0..len], stream_name);
+        const normalized = windowsStripVerbatimPrefix(path_buf[0..len]);
+        return windowsMakeAdsPathW(buf, normalized, stream_name);
     }
 
     fn windowsReadAdsPathW(path_w: [*:0]const u16, buf: []u8) bool {
@@ -3476,7 +3498,26 @@ const Config = struct {
     no_tui: bool = false,
     help: bool = false,
     version: bool = false,
+    format: zdu.Format = .human,
+    max_depth: ?usize = null,
+    show_hidden: bool = false,
+    summarize: bool = true,
 };
+
+fn formatSizeHuman(buf: *[32]u8, size: u64) []const u8 {
+    const units = "BKMGTPE";
+    var val: f64 = @floatFromInt(size);
+    var unit_idx: usize = 0;
+
+    while (val >= 1024 and unit_idx < units.len - 1) : (unit_idx += 1) {
+        val /= 1024;
+    }
+
+    if (unit_idx == 0) {
+        return std.fmt.bufPrint(buf, "{d}", .{@as(u64, @intFromFloat(val))}) catch unreachable;
+    }
+    return std.fmt.bufPrint(buf, "{d:.1}{c}", .{ val, units[unit_idx] }) catch unreachable;
+}
 
 fn printHelp(writer: anytype) !void {
     try writer.writeAll(
@@ -3486,6 +3527,10 @@ fn printHelp(writer: anytype) !void {
         \\  -h, --help              Show this help message and exit
         \\  -v, --version           Show version and exit
         \\  --no-tui                Print total size and exit (no interactive UI)
+        \\  --format <human|json>   Output format for --no-tui (default: human)
+        \\  --max-depth <n>         Limit recursion depth
+        \\  --show-hidden           Include dotfiles in output
+        \\  --summarize             Show totals only (default for --no-tui)
         \\  --cache-ttl [seconds]   Trust cached stats within TTL (default 60s if no value)
         \\  --refresh-cache         Recompute and rewrite cache entries
         \\  --parallel              Enable parallel directory scanning
@@ -3496,6 +3541,7 @@ fn printHelp(writer: anytype) !void {
         \\  zdu
         \\  zdu /home/user/git
         \\  zdu --no-tui /home/user/git
+        \\  zdu --no-tui --format json /home/user/git
         \\  zdu --cache-ttl 300 /home/user/git
         \\  zdu --no-tui --refresh-cache --cache-ttl 1800 /path/to/scan
         \\  zdu --parallel --jobs 8 --refresh-cache --cache-ttl 1800 /path/to/scan
@@ -3545,6 +3591,29 @@ fn parseArgs(args: []const []const u8) !Config {
             config.bench = true;
         } else if (mem.eql(u8, arg, "--no-tui")) {
             config.no_tui = true;
+        } else if (mem.eql(u8, arg, "--format")) {
+            if (idx + 1 < args.len) {
+                const next_arg = args[idx + 1];
+                if (mem.eql(u8, next_arg, "json")) {
+                    config.format = .json;
+                    idx += 1;
+                } else if (mem.eql(u8, next_arg, "human")) {
+                    config.format = .human;
+                    idx += 1;
+                }
+            }
+        } else if (mem.eql(u8, arg, "--max-depth")) {
+            if (idx + 1 < args.len) {
+                const next_arg = args[idx + 1];
+                if (std.fmt.parseInt(usize, next_arg, 10)) |val| {
+                    config.max_depth = val;
+                    idx += 1;
+                } else |_| {}
+            }
+        } else if (mem.eql(u8, arg, "--show-hidden")) {
+            config.show_hidden = true;
+        } else if (mem.eql(u8, arg, "--summarize")) {
+            config.summarize = true;
         } else {
             config.cwd = arg;
         }
