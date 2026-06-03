@@ -5,12 +5,22 @@ const vxfw = vaxis.vxfw;
 const zdu = @import("zdu");
 const mem = std.mem;
 
-const c_stat = struct {
-    extern "c" fn fstatat(dirfd: std.c.fd_t, path: [*:0]const u8, buf: *std.c.Stat, flag: u32) c_int;
+const have_posix_stat = builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos);
+const PosixStat = if (have_posix_stat) std.c.Stat else struct {
+    size: i64 = 0,
+    mode: u32 = 0,
+    blocks: i64 = 0,
 };
 
-const darwin_xattr = struct {
+const c_stat = if (have_posix_stat) struct {
+    extern "c" fn fstatat(dirfd: std.c.fd_t, path: [*:0]const u8, buf: *std.c.Stat, flag: u32) c_int;
+} else struct {};
+
+const c_time = if (builtin.os.tag == .macos) struct {
     extern "c" fn time(timer: ?*i64) i64;
+} else struct {};
+
+const darwin_xattr = if (builtin.os.tag == .macos) struct {
     extern "c" fn getxattr(
         path: [*:0]const u8,
         name: [*:0]const u8,
@@ -48,7 +58,79 @@ const darwin_xattr = struct {
         position: u32,
         options: c_int,
     ) c_int;
-};
+} else struct {};
+
+const windows_ads = if (builtin.os.tag == .windows) struct {
+    const HANDLE = std.os.windows.HANDLE;
+    const DWORD = u32;
+
+    const GENERIC_READ: DWORD = 0x80000000;
+    const GENERIC_WRITE: DWORD = 0x40000000;
+    const FILE_SHARE_READ: DWORD = 0x00000001;
+    const FILE_SHARE_WRITE: DWORD = 0x00000002;
+    const FILE_SHARE_DELETE: DWORD = 0x00000004;
+    const CREATE_ALWAYS: DWORD = 2;
+    const OPEN_EXISTING: DWORD = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
+    const FILE_NAME_NORMALIZED: DWORD = 0x00000000;
+    const VOLUME_NAME_DOS: DWORD = 0x00000000;
+
+    const share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+    extern "kernel32" fn CloseHandle(hObject: HANDLE) c_int;
+    extern "kernel32" fn CreateFileW(
+        lpFileName: [*:0]const u16,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        lpSecurityAttributes: ?*anyopaque,
+        dwCreationDisposition: DWORD,
+        dwFlagsAndAttributes: DWORD,
+        hTemplateFile: ?HANDLE,
+    ) HANDLE;
+    extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) c_int;
+    extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) c_int;
+    extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) void;
+    extern "kernel32" fn GetFinalPathNameByHandleW(
+        hFile: HANDLE,
+        lpszFilePath: [*]u16,
+        cchFilePath: DWORD,
+        dwFlags: DWORD,
+    ) DWORD;
+    extern "kernel32" fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: [*]u8,
+        nNumberOfBytesToRead: DWORD,
+        lpNumberOfBytesRead: *DWORD,
+        lpOverlapped: ?*anyopaque,
+    ) c_int;
+    extern "kernel32" fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: [*]const u8,
+        nNumberOfBytesToWrite: DWORD,
+        lpNumberOfBytesWritten: *DWORD,
+        lpOverlapped: ?*anyopaque,
+    ) c_int;
+
+    fn isInvalidHandle(handle: HANDLE) bool {
+        return @intFromPtr(handle) == std.math.maxInt(usize);
+    }
+} else struct {};
+
+fn posixStatIsRegular(stat: PosixStat) bool {
+    if (comptime !have_posix_stat) return false;
+    return std.c.S.ISREG(stat.mode);
+}
+
+fn posixStatApparentSize(stat: PosixStat) u64 {
+    return if (stat.size < 0) 0 else @intCast(stat.size);
+}
+
+fn posixStatAllocatedSize(stat: PosixStat) u64 {
+    const apparent_size = posixStatApparentSize(stat);
+    if (!posixStatIsRegular(stat)) return apparent_size;
+    if (stat.blocks <= 0) return apparent_size;
+    return @as(u64, @intCast(stat.blocks)) * 512;
+}
 
 pub const Model = struct {
     io: std.Io,
@@ -1370,12 +1452,14 @@ pub const Model = struct {
         };
     }
 
-    fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?std.c.Stat {
+    fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?PosixStat {
+        if (comptime !have_posix_stat) return null;
+
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         if (sub_path.len + 1 > path_buf.len) return null;
         @memcpy(path_buf[0..sub_path.len], sub_path);
         path_buf[sub_path.len] = 0;
-        var stat: std.c.Stat = undefined;
+        var stat: PosixStat = undefined;
         if (c_stat.fstatat(dir.handle, @ptrCast(path_buf[0..sub_path.len :0].ptr), &stat, std.c.AT.SYMLINK_NOFOLLOW) != 0) {
             return null;
         }
@@ -1383,11 +1467,10 @@ pub const Model = struct {
     }
 
     fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+        if (comptime !have_posix_stat) return fileSizeOnDiskFallbackAt(dir, sub_path, io);
+
         const stat = cStatAt(dir, sub_path) orelse return fileSizeOnDiskFallbackAt(dir, sub_path, io);
-        const apparent_size: u64 = if (stat.size < 0) 0 else @intCast(stat.size);
-        if (!std.c.S.ISREG(stat.mode)) return apparent_size;
-        if (stat.blocks <= 0) return apparent_size;
-        return @as(u64, @intCast(stat.blocks)) * 512;
+        return posixStatAllocatedSize(stat);
     }
 
     fn fileSizeOnDiskFallbackAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
@@ -1403,6 +1486,183 @@ pub const Model = struct {
     fn readCachedDirSizeFd(dir: std.Io.Dir) ?u64 {
         if (readCachedDirStatsFd(dir)) |stats| return stats.size;
         return null;
+    }
+
+    const windows_max_path_wchars = 32768;
+    const windows_ads_path_extra_wchars = 128;
+
+    fn windowsPathNeedsDotPrefix(path: []const u8) bool {
+        if (path.len == 0) return false;
+        if (path[0] == '\\' or path[0] == '/') return false;
+        if (path.len >= 2 and path[1] == ':') return false;
+        return true;
+    }
+
+    fn windowsAllocAdsPath(allocator: mem.Allocator, path: []const u8, stream_name: [:0]const u8) ?[:0]u16 {
+        if (comptime builtin.os.tag != .windows) return null;
+
+        const prefix = if (windowsPathNeedsDotPrefix(path)) ".\\" else "";
+        const ads_path_utf8 = std.fmt.allocPrint(allocator, "{s}{s}:{s}:$DATA", .{ prefix, path, stream_name }) catch return null;
+        defer allocator.free(ads_path_utf8);
+
+        return std.unicode.utf8ToUtf16LeAllocZ(allocator, ads_path_utf8) catch return null;
+    }
+
+    fn windowsMakeAdsPathW(buf: []u16, base_path: []const u16, stream_name: [:0]const u8) ?[:0]u16 {
+        if (comptime builtin.os.tag != .windows) return null;
+
+        const stream_type = ":$DATA";
+        const needed = base_path.len + 1 + stream_name.len + stream_type.len + 1;
+        if (needed > buf.len) return null;
+
+        var idx: usize = 0;
+        @memcpy(buf[idx..][0..base_path.len], base_path);
+        idx += base_path.len;
+
+        buf[idx] = ':';
+        idx += 1;
+
+        for (stream_name) |ch| {
+            buf[idx] = ch;
+            idx += 1;
+        }
+
+        for (stream_type) |ch| {
+            buf[idx] = ch;
+            idx += 1;
+        }
+
+        buf[idx] = 0;
+        return buf[0..idx :0];
+    }
+
+    fn windowsAdsPathFromDirHandle(dir: std.Io.Dir, stream_name: [:0]const u8, buf: []u16) ?[:0]u16 {
+        if (comptime builtin.os.tag != .windows) return null;
+
+        var path_buf: [windows_max_path_wchars]u16 = undefined;
+        const len_raw = windows_ads.GetFinalPathNameByHandleW(
+            dir.handle,
+            path_buf[0..].ptr,
+            @intCast(path_buf.len),
+            windows_ads.FILE_NAME_NORMALIZED | windows_ads.VOLUME_NAME_DOS,
+        );
+        if (len_raw == 0) return null;
+
+        const len: usize = @intCast(len_raw);
+        if (len >= path_buf.len) return null;
+
+        return windowsMakeAdsPathW(buf, path_buf[0..len], stream_name);
+    }
+
+    fn windowsReadAdsPathW(path_w: [*:0]const u16, buf: []u8) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+
+        const handle = windows_ads.CreateFileW(
+            path_w,
+            windows_ads.GENERIC_READ,
+            windows_ads.share_all,
+            null,
+            windows_ads.OPEN_EXISTING,
+            windows_ads.FILE_FLAG_BACKUP_SEMANTICS,
+            null,
+        );
+        if (windows_ads.isInvalidHandle(handle)) return false;
+        defer _ = windows_ads.CloseHandle(handle);
+
+        var file_size: i64 = 0;
+        if (windows_ads.GetFileSizeEx(handle, &file_size) == 0) return false;
+        if (file_size < 0 or @as(u64, @intCast(file_size)) != buf.len) return false;
+
+        var bytes_read: windows_ads.DWORD = 0;
+        if (windows_ads.ReadFile(handle, buf.ptr, @intCast(buf.len), &bytes_read, null) == 0) return false;
+        return bytes_read == buf.len;
+    }
+
+    fn windowsWriteAdsPathW(path_w: [*:0]const u16, buf: []const u8) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+
+        const handle = windows_ads.CreateFileW(
+            path_w,
+            windows_ads.GENERIC_WRITE,
+            windows_ads.share_all,
+            null,
+            windows_ads.CREATE_ALWAYS,
+            windows_ads.FILE_FLAG_BACKUP_SEMANTICS,
+            null,
+        );
+        if (windows_ads.isInvalidHandle(handle)) return false;
+        defer _ = windows_ads.CloseHandle(handle);
+
+        var bytes_written: windows_ads.DWORD = 0;
+        if (windows_ads.WriteFile(handle, buf.ptr, @intCast(buf.len), &bytes_written, null) == 0) return false;
+        return bytes_written == buf.len;
+    }
+
+    fn windowsDeleteAdsPathW(path_w: [*:0]const u16) void {
+        if (comptime builtin.os.tag != .windows) return;
+        _ = windows_ads.DeleteFileW(path_w);
+    }
+
+    fn windowsReadAds(path: []const u8, stream_name: [:0]const u8, buf: []u8, allocator: mem.Allocator) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+
+        const ads_path = windowsAllocAdsPath(allocator, path, stream_name) orelse return false;
+        defer allocator.free(ads_path);
+        return windowsReadAdsPathW(ads_path.ptr, buf);
+    }
+
+    fn windowsReadAdsFd(dir: std.Io.Dir, stream_name: [:0]const u8, buf: []u8) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+
+        var ads_buf: [windows_max_path_wchars + windows_ads_path_extra_wchars]u16 = undefined;
+        const ads_path = windowsAdsPathFromDirHandle(dir, stream_name, ads_buf[0..]) orelse return false;
+        return windowsReadAdsPathW(ads_path.ptr, buf);
+    }
+
+    fn windowsWriteAds(path: []const u8, stream_name: [:0]const u8, buf: []const u8, allocator: mem.Allocator) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+
+        const ads_path = windowsAllocAdsPath(allocator, path, stream_name) orelse return false;
+        defer allocator.free(ads_path);
+        return windowsWriteAdsPathW(ads_path.ptr, buf);
+    }
+
+    fn windowsWriteAdsFd(dir: std.Io.Dir, stream_name: [:0]const u8, buf: []const u8) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+
+        var ads_buf: [windows_max_path_wchars + windows_ads_path_extra_wchars]u16 = undefined;
+        const ads_path = windowsAdsPathFromDirHandle(dir, stream_name, ads_buf[0..]) orelse return false;
+        return windowsWriteAdsPathW(ads_path.ptr, buf);
+    }
+
+    fn windowsDeleteAds(path: []const u8, stream_name: [:0]const u8, allocator: mem.Allocator) void {
+        if (comptime builtin.os.tag != .windows) return;
+
+        const ads_path = windowsAllocAdsPath(allocator, path, stream_name) orelse return;
+        defer allocator.free(ads_path);
+        windowsDeleteAdsPathW(ads_path.ptr);
+    }
+
+    fn decodeCachedDirStatsBuf(buf: *const [32]u8, now: u64) ?DirStats {
+        const record = decodeCachedDirStats(buf);
+        if (record.expires_at < now) return null;
+        return .{
+            .size = record.size,
+            .file_count = record.file_count,
+            .dir_count = record.dir_count,
+        };
+    }
+
+    fn decodeCachedDirSizeBuf(buf: *const [16]u8, now: u64) ?DirStats {
+        const record = decodeCachedDirSize(buf);
+        if (record.expires_at < now) return null;
+        return .{ .size = record.size };
+    }
+
+    fn readCachedDirStatsV2Windows(path: []const u8, allocator: mem.Allocator, now: u64) ?DirStats {
+        var buf: [16]u8 = undefined;
+        if (!windowsReadAds(path, dir_size_xattr_name, buf[0..], allocator)) return null;
+        return decodeCachedDirSizeBuf(&buf, now);
     }
 
     fn readCachedDirStats(path: []const u8, allocator: mem.Allocator) ?DirStats {
@@ -1445,6 +1705,12 @@ pub const Model = struct {
                     else => return readCachedDirStatsV2Z(path_z.ptr, now),
                 }
             },
+            .windows => {
+                if (windowsReadAds(path, dir_stats_xattr_name, buf[0..], allocator)) {
+                    return decodeCachedDirStatsBuf(&buf, now);
+                }
+                return readCachedDirStatsV2Windows(path, allocator, now);
+            },
             else => return null,
         }
     }
@@ -1486,6 +1752,12 @@ pub const Model = struct {
                     },
                     else => return readCachedDirStatsV2Fd(dir, now),
                 }
+            },
+            .windows => {
+                if (windowsReadAdsFd(dir, dir_stats_xattr_name, buf[0..])) {
+                    return decodeCachedDirStatsBuf(&buf, now);
+                }
+                return readCachedDirStatsV2Fd(dir, now);
             },
             else => return null,
         }
@@ -1557,6 +1829,10 @@ pub const Model = struct {
                     else => return null,
                 }
             },
+            .windows => {
+                if (!windowsReadAdsFd(dir, dir_size_xattr_name, buf[0..])) return null;
+                return decodeCachedDirSizeBuf(&buf, now);
+            },
             else => return null,
         }
     }
@@ -1585,6 +1861,10 @@ pub const Model = struct {
                 _ = darwin_xattr.setxattr(path_z.ptr, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0, 0);
                 _ = darwin_xattr.setxattr(path_z.ptr, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0, 0);
             },
+            .windows => {
+                _ = windowsWriteAds(path, dir_stats_xattr_name, stats_buf[0..], allocator);
+                _ = windowsWriteAds(path, dir_size_xattr_name, size_buf[0..], allocator);
+            },
             else => {},
         }
     }
@@ -1602,6 +1882,10 @@ pub const Model = struct {
             .macos => {
                 _ = darwin_xattr.fsetxattr(dir.handle, dir_stats_xattr_name, stats_buf[0..].ptr, stats_buf.len, 0, 0);
                 _ = darwin_xattr.fsetxattr(dir.handle, dir_size_xattr_name, size_buf[0..].ptr, size_buf.len, 0, 0);
+            },
+            .windows => {
+                _ = windowsWriteAdsFd(dir, dir_stats_xattr_name, stats_buf[0..]);
+                _ = windowsWriteAdsFd(dir, dir_size_xattr_name, size_buf[0..]);
             },
             else => {},
         }
@@ -1621,9 +1905,16 @@ pub const Model = struct {
                 }
             },
             .macos => {
-                const now = darwin_xattr.time(null);
+                const now = c_time.time(null);
                 if (now < 0) return null;
                 return @as(u64, @intCast(now));
+            },
+            .windows => {
+                var ft: std.os.windows.FILETIME = undefined;
+                windows_ads.GetSystemTimeAsFileTime(&ft);
+                const hns = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+                if (hns < 116444736000000000) return null;
+                return (hns - 116444736000000000) / 10000000;
             },
             else => return null,
         }
@@ -1699,6 +1990,10 @@ pub const Model = struct {
             .macos => {
                 _ = darwin_xattr.removexattr(path_z.ptr, dir_stats_xattr_name, 0);
                 _ = darwin_xattr.removexattr(path_z.ptr, dir_size_xattr_name, 0);
+            },
+            .windows => {
+                windowsDeleteAds(path, dir_stats_xattr_name, allocator);
+                windowsDeleteAds(path, dir_size_xattr_name, allocator);
             },
             else => {},
         }
@@ -2464,7 +2759,7 @@ test "root summary stays sticky while long root list scrolls" {
 }
 
 test "directory size xattr round trip" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2479,6 +2774,114 @@ test "directory size xattr round trip" {
     try std.testing.expectEqual(@as(?u64, 1234), cached);
 
     Model.clearCachedDirSize(dir_path, std.testing.allocator);
+}
+
+test "Windows ADS relative paths get explicit current-directory prefix" {
+    try std.testing.expect(Model.windowsPathNeedsDotPrefix("relative"));
+    try std.testing.expect(Model.windowsPathNeedsDotPrefix("relative\\path"));
+    try std.testing.expect(!Model.windowsPathNeedsDotPrefix("C:\\absolute"));
+    try std.testing.expect(!Model.windowsPathNeedsDotPrefix("/absolute"));
+    try std.testing.expect(!Model.windowsPathNeedsDotPrefix("\\\\server\\share"));
+}
+
+test "Windows ADS path helper appends named data stream suffix" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const base_ascii = "C:\\tmp\\zdu-dir";
+    var base: [base_ascii.len]u16 = undefined;
+    for (base_ascii, 0..) |ch, idx| base[idx] = ch;
+
+    var buf: [256]u16 = undefined;
+    const ads_path = Model.windowsMakeAdsPathW(buf[0..], base[0..], Model.dir_stats_xattr_name) orelse return error.SkipZigTest;
+
+    try zduTestExpectUtf16AsciiEqual(
+        "C:\\tmp\\zdu-dir:user.zdu.dir_stats.v3:$DATA",
+        ads_path[0.."C:\\tmp\\zdu-dir:user.zdu.dir_stats.v3:$DATA".len],
+    );
+}
+
+test "Windows ADS cache round trip works by path and directory handle" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root");
+
+    const root_path = try zduTestTmpPath(allocator, &tmp, "root");
+    defer allocator.free(root_path);
+
+    Model.clearCachedDirStats(root_path, allocator);
+
+    const written: Model.DirStats = .{ .size = 4321, .file_count = 7, .dir_count = 3 };
+    Model.writeCachedDirStats(root_path, written, 60, allocator);
+
+    const by_path = Model.readCachedDirStats(root_path, allocator) orelse return error.SkipZigTest;
+    try std.testing.expectEqual(written.size, by_path.size);
+    try std.testing.expectEqual(written.file_count, by_path.file_count);
+    try std.testing.expectEqual(written.dir_count, by_path.dir_count);
+
+    var dir = std.Io.Dir.cwd().openDir(std.testing.io, root_path, .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close(std.testing.io);
+
+    const by_handle = Model.readCachedDirStatsFd(dir) orelse return error.SkipZigTest;
+    try std.testing.expectEqual(written.size, by_handle.size);
+    try std.testing.expectEqual(written.file_count, by_handle.file_count);
+    try std.testing.expectEqual(written.dir_count, by_handle.dir_count);
+
+    Model.clearCachedDirStats(root_path, allocator);
+    try std.testing.expect(Model.readCachedDirStats(root_path, allocator) == null);
+}
+
+test "Windows ADS cache falls back to legacy v2 size stream" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root");
+
+    const root_path = try zduTestTmpPath(allocator, &tmp, "root");
+    defer allocator.free(root_path);
+
+    const now = Model.currentTimestampSeconds() orelse return error.SkipZigTest;
+
+    var legacy_record: [16]u8 = undefined;
+    zduTestEncodeCacheRecord(&legacy_record, 9876, now + 60);
+
+    Model.clearCachedDirStats(root_path, allocator);
+    if (!Model.windowsWriteAds(root_path, Model.dir_size_xattr_name, legacy_record[0..], allocator)) return error.SkipZigTest;
+
+    const cached = Model.readCachedDirStats(root_path, allocator) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 9876), cached.size);
+    try std.testing.expectEqual(@as(u64, 0), cached.file_count);
+    try std.testing.expectEqual(@as(u64, 0), cached.dir_count);
+}
+
+test "Windows ADS cache rejects wrong-length stats stream" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "root");
+
+    const root_path = try zduTestTmpPath(allocator, &tmp, "root");
+    defer allocator.free(root_path);
+
+    Model.clearCachedDirStats(root_path, allocator);
+
+    var malformed_record: [31]u8 = undefined;
+    @memset(malformed_record[0..], 0xaa);
+    if (!Model.windowsWriteAds(root_path, Model.dir_stats_xattr_name, malformed_record[0..], allocator)) return error.SkipZigTest;
+
+    try std.testing.expect(Model.readCachedDirStats(root_path, allocator) == null);
 }
 
 test "mouse clicks outside the visible list are ignored" {
@@ -2617,7 +3020,7 @@ test "down key on an empty list does not underflow" {
 
 test "delete walks parent chain and updates cached stats without a rescan" {
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
 
@@ -2702,7 +3105,7 @@ test "uppercase Y confirms delete" {
 }
 
 test "delete propagation skips missing cache instead of recomputing" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2723,7 +3126,7 @@ test "delete propagation skips missing cache instead of recomputing" {
 }
 
 test "delete propagation skips stale undersized cache" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2749,7 +3152,7 @@ test "delete propagation skips stale undersized cache" {
 }
 
 test "delete delta updates cached ancestors by walking the model chain" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3218,6 +3621,13 @@ test "parallel scan tasks are sorted by cached file count" {
     try std.testing.expectEqualStrings("small", tasks[2].path);
 }
 
+fn zduTestExpectUtf16AsciiEqual(expected: []const u8, actual: []const u16) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, 0..) |ch, idx| {
+        try std.testing.expectEqual(@as(u16, ch), actual[idx]);
+    }
+}
+
 fn zduTestTmpPath(
     allocator: mem.Allocator,
     tmp: *std.testing.TmpDir,
@@ -3292,6 +3702,9 @@ fn zduTestSetRawDirSizeXattr(
             );
             if (std.c.errno(rc) != .SUCCESS) return error.SkipZigTest;
         },
+        .windows => {
+            if (!Model.windowsWriteAds(path, Model.dir_size_xattr_name, bytes, allocator)) return error.SkipZigTest;
+        },
         else => return error.SkipZigTest,
     }
 }
@@ -3327,13 +3740,16 @@ fn zduTestSetRawDirStatsXattr(
             );
             if (std.c.errno(rc) != .SUCCESS) return error.SkipZigTest;
         },
+        .windows => {
+            if (!Model.windowsWriteAds(path, Model.dir_stats_xattr_name, bytes, allocator)) return error.SkipZigTest;
+        },
         else => return error.SkipZigTest,
     }
 }
 
 test "loading writes each nested directory cache with that directory's own size" {
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
 
@@ -3397,7 +3813,7 @@ test "loading writes each nested directory cache with that directory's own size"
 
 test "scanRootStats refreshes v3 stats cache with file counts" {
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
 
@@ -3437,7 +3853,7 @@ test "scanRootStats refreshes v3 stats cache with file counts" {
 
 test "dir stats xattr cache stores file counts and rejects expired or malformed records" {
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
 
@@ -3503,7 +3919,7 @@ test "dir stats xattr cache stores file counts and rejects expired or malformed 
 
 test "expired dir size cache is recomputed and refreshed" {
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
 
@@ -3547,7 +3963,7 @@ test "expired dir size cache is recomputed and refreshed" {
 
 test "refresh cache ignores a still-fresh stats record" {
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
 
@@ -3578,7 +3994,7 @@ test "refresh cache ignores a still-fresh stats record" {
 
 test "parallel root scan matches serial stack scan" {
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
 
@@ -3620,7 +4036,7 @@ test "parallel root scan matches serial stack scan" {
 
 test "dynamic parallel scan splits nested children and waits before parent cache write" {
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
 

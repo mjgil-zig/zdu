@@ -25,22 +25,38 @@ jobs:
           - name: Linux x86_64
             runner: ubuntu-24.04
             target: x86_64-linux-gnu
+            binary: zdu
             file_kind: ELF
 
           - name: Linux arm64
             runner: ubuntu-24.04-arm
             target: aarch64-linux-gnu
+            binary: zdu
             file_kind: ELF
 
           - name: macOS arm64
             runner: macos-15
             target: aarch64-macos
+            binary: zdu
             file_kind: Mach-O
 
           - name: macOS x86_64
             runner: macos-15-intel
             target: x86_64-macos
+            binary: zdu
             file_kind: Mach-O
+
+          - name: Windows x86_64
+            runner: ubuntu-24.04
+            target: x86_64-windows
+            binary: zdu.exe
+            file_kind: PE32
+
+          - name: Windows arm64
+            runner: ubuntu-24.04
+            target: aarch64-windows
+            binary: zdu.exe
+            file_kind: PE32
 
     steps:
       - name: Checkout
@@ -85,15 +101,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -x zig-out/bin/zdu
-          file zig-out/bin/zdu
+          bin="zig-out/bin/${{ matrix.binary }}"
+          test -f "$bin"
+          if [ "${{ matrix.binary }}" = "zdu" ]; then
+            test -x "$bin"
+          fi
+          file "$bin"
 
           case "${{ matrix.file_kind }}" in
             Mach-O)
-              file zig-out/bin/zdu | grep -q 'Mach-O'
+              file "$bin" | grep -q 'Mach-O'
               ;;
             ELF)
-              file zig-out/bin/zdu | grep -q 'ELF'
+              file "$bin" | grep -q 'ELF'
+              ;;
+            PE32)
+              file "$bin" | grep -Eq 'PE32|MS Windows'
               ;;
             *)
               echo "unknown file_kind: ${{ matrix.file_kind }}" >&2
@@ -105,8 +128,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -x zig-out/bin/zdu
-          file zig-out/bin/zdu || true
+          bin="zig-out/bin/${{ matrix.binary }}"
+          test -f "$bin"
+          file "$bin" || true
 
       - name: Smoke test xattrs
         if: runner.os == 'macOS'
@@ -120,3 +144,77 @@ jobs:
           xattr -w user.zdu.ci ok "$tmp"
           got="$(xattr -p user.zdu.ci "$tmp")"
           test "$got" = "ok"
+
+  windows-native-tests:
+    name: Windows native tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\zig
+            .zig-cache
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon', 'build.zig', 'src/**/*.zig', 'lib/**/*.zig') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-zig-${{ env.ZIG_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-zig-
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          zig version
+          $PSVersionTable.PSVersion
+
+      - name: Check formatting
+        shell: pwsh
+        run: zig fmt --check build.zig build.zig.zon src lib
+
+      - name: Run Windows tests
+        shell: pwsh
+        run: zig build test --summary all
+
+      - name: Build Windows debug
+        shell: pwsh
+        run: zig build --summary all
+
+      - name: Build Windows release
+        shell: pwsh
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows -Dcpu=baseline --summary all
+
+      - name: Verify Windows executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path zig-out/bin/zdu.exe)) { throw "missing zig-out/bin/zdu.exe" }
+          Get-Item zig-out/bin/zdu.exe
+
+      - name: Smoke test Windows binary
+        shell: pwsh
+        run: |
+          $out = & zig-out/bin/zdu.exe --no-tui .
+          if ($LASTEXITCODE -ne 0) { throw "zdu.exe smoke test failed with exit code $LASTEXITCODE" }
+          if ($out -notmatch '^\d+$') { throw "zdu.exe smoke test returned unexpected output: $out" }
+
+      - name: Smoke test NTFS alternate data streams
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:RUNNER_TEMP ("zdu-ads-" + [Guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $tmp | Out-Null
+          $file = Join-Path $tmp "probe.txt"
+          Set-Content -LiteralPath $file -Value "base" -NoNewline
+          try {
+            Set-Content -LiteralPath "${file}:user.zdu.ci" -Value "ok" -NoNewline
+            $got = Get-Content -LiteralPath "${file}:user.zdu.ci" -Raw
+            if ($got -ne "ok") { throw "ADS smoke test returned '$got'" }
+          } finally {
+            Remove-Item -LiteralPath $tmp -Recurse -Force
+          }

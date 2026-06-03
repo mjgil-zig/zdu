@@ -26,22 +26,44 @@ jobs:
           - runner: macos-15
             target: aarch64-macos
             asset: zdu-aarch64-macos.tar.gz
+            binary: zdu
+            package: tar.gz
             file_kind: Mach-O
 
           - runner: macos-15-intel
             target: x86_64-macos
             asset: zdu-x86_64-macos.tar.gz
+            binary: zdu
+            package: tar.gz
             file_kind: Mach-O
 
           - runner: ubuntu-24.04
             target: x86_64-linux-gnu
             asset: zdu-x86_64-linux.tar.gz
+            binary: zdu
+            package: tar.gz
             file_kind: ELF
 
           - runner: ubuntu-24.04-arm
             target: aarch64-linux-gnu
             asset: zdu-aarch64-linux.tar.gz
+            binary: zdu
+            package: tar.gz
             file_kind: ELF
+
+          - runner: ubuntu-24.04
+            target: x86_64-windows
+            asset: zdu-x86_64-windows.zip
+            binary: zdu.exe
+            package: zip
+            file_kind: PE32
+
+          - runner: ubuntu-24.04
+            target: aarch64-windows
+            asset: zdu-aarch64-windows.zip
+            binary: zdu.exe
+            package: zip
+            file_kind: PE32
 
     steps:
       - name: Checkout
@@ -75,15 +97,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -x zig-out/bin/zdu
-          file zig-out/bin/zdu
+          bin="zig-out/bin/${{ matrix.binary }}"
+          test -f "$bin"
+          if [ "${{ matrix.binary }}" = "zdu" ]; then
+            test -x "$bin"
+          fi
+          file "$bin"
 
           case "${{ matrix.file_kind }}" in
             Mach-O)
-              file zig-out/bin/zdu | grep -q 'Mach-O'
+              file "$bin" | grep -q 'Mach-O'
               ;;
             ELF)
-              file zig-out/bin/zdu | grep -q 'ELF'
+              file "$bin" | grep -q 'ELF'
+              ;;
+            PE32)
+              file "$bin" | grep -Eq 'PE32|MS Windows'
               ;;
             *)
               echo "unknown file_kind: ${{ matrix.file_kind }}" >&2
@@ -97,11 +126,32 @@ jobs:
           set -euo pipefail
 
           mkdir -p package dist
-          cp zig-out/bin/zdu package/zdu
-          chmod 755 package/zdu
+          cp "zig-out/bin/${{ matrix.binary }}" "package/${{ matrix.binary }}"
+          if [ "${{ matrix.binary }}" = "zdu" ]; then
+            chmod 755 package/zdu
+          fi
 
-          # Avoid macOS AppleDouble metadata in tarballs.
-          COPYFILE_DISABLE=1 tar -C package -czf "dist/${{ matrix.asset }}" zdu
+          case "${{ matrix.package }}" in
+            tar.gz)
+              # Avoid macOS AppleDouble metadata in tarballs.
+              COPYFILE_DISABLE=1 tar -C package -czf "dist/${{ matrix.asset }}" "${{ matrix.binary }}"
+              ;;
+            zip)
+              ASSET="${{ matrix.asset }}" BINARY="${{ matrix.binary }}" python3 - <<'PY'
+          import os
+          import zipfile
+
+          asset = os.environ["ASSET"]
+          binary = os.environ["BINARY"]
+          with zipfile.ZipFile(os.path.join("dist", asset), "w", zipfile.ZIP_DEFLATED) as zf:
+              zf.write(os.path.join("package", binary), arcname=binary)
+          PY
+              ;;
+            *)
+              echo "unknown package kind: ${{ matrix.package }}" >&2
+              exit 1
+              ;;
+          esac
 
           cd dist
           shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"

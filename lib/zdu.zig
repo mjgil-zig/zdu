@@ -4,9 +4,37 @@ const mem = std.mem;
 
 const builtin = @import("builtin");
 
-const c_stat = struct {
-    extern "c" fn fstatat(dirfd: std.c.fd_t, path: [*:0]const u8, buf: *std.c.Stat, flag: u32) c_int;
+const have_posix_stat = builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos);
+const PosixStat = if (have_posix_stat) std.c.Stat else struct {
+    size: i64 = 0,
+    mode: u32 = 0,
+    blocks: i64 = 0,
 };
+
+const c_stat = if (have_posix_stat) struct {
+    extern "c" fn fstatat(dirfd: std.c.fd_t, path: [*:0]const u8, buf: *std.c.Stat, flag: u32) c_int;
+} else struct {};
+
+fn posixStatIsRegular(stat: PosixStat) bool {
+    if (comptime !have_posix_stat) return false;
+    return std.c.S.ISREG(stat.mode);
+}
+
+fn posixStatIsDirectory(stat: PosixStat) bool {
+    if (comptime !have_posix_stat) return false;
+    return std.c.S.ISDIR(stat.mode);
+}
+
+fn posixStatApparentSize(stat: PosixStat) u64 {
+    return if (stat.size < 0) 0 else @intCast(stat.size);
+}
+
+fn posixStatAllocatedSize(stat: PosixStat) u64 {
+    const apparent_size = posixStatApparentSize(stat);
+    if (!posixStatIsRegular(stat)) return apparent_size;
+    if (stat.blocks <= 0) return apparent_size;
+    return @as(u64, @intCast(stat.blocks)) * 512;
+}
 
 pub const Format = enum {
     human,
@@ -143,12 +171,14 @@ pub fn pathNeedsGeneratedDirChecks(path: []const u8) bool {
     return mem.eql(u8, path, "/") or isGeneratedDirPath(path);
 }
 
-pub fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?std.c.Stat {
+pub fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?PosixStat {
+    if (comptime !have_posix_stat) return null;
+
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (sub_path.len + 1 > path_buf.len) return null;
     @memcpy(path_buf[0..sub_path.len], sub_path);
     path_buf[sub_path.len] = 0;
-    var stat: std.c.Stat = undefined;
+    var stat: PosixStat = undefined;
     if (c_stat.fstatat(dir.handle, @ptrCast(path_buf[0..sub_path.len :0].ptr), &stat, std.c.AT.SYMLINK_NOFOLLOW) != 0) {
         return null;
     }
@@ -169,11 +199,10 @@ pub fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
 }
 
 pub fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
+    if (comptime !have_posix_stat) return fileSizeOnDiskFallbackAt(dir, sub_path, io);
+
     const stat = cStatAt(dir, sub_path) orelse return fileSizeOnDiskFallbackAt(dir, sub_path, io);
-    const apparent_size: u64 = if (stat.size < 0) 0 else @intCast(stat.size);
-    if (!std.c.S.ISREG(stat.mode)) return apparent_size;
-    if (stat.blocks <= 0) return apparent_size;
-    return @as(u64, @intCast(stat.blocks)) * 512;
+    return posixStatAllocatedSize(stat);
 }
 
 pub fn fileSizeOnDiskFallbackAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
@@ -340,15 +369,14 @@ fn entryKindAndSize(
         return .{ .is_dir = true, .is_file = false, .size = 0 };
     }
 
-    if (builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos)) {
+    if (comptime have_posix_stat) {
         const stat = cStatAt(dir, name) orelse {
             error_count.* += 1;
             return .{ .is_dir = false, .is_file = initial_kind == .file, .size = 0 };
         };
-        const is_dir = std.c.S.ISDIR(stat.mode);
-        const is_file = std.c.S.ISREG(stat.mode);
-        const apparent_size: u64 = if (stat.size < 0) 0 else @intCast(stat.size);
-        const size = if (is_file and stat.blocks > 0) @as(u64, @intCast(stat.blocks)) * 512 else apparent_size;
+        const is_dir = posixStatIsDirectory(stat);
+        const is_file = posixStatIsRegular(stat);
+        const size = posixStatAllocatedSize(stat);
         return .{ .is_dir = is_dir, .is_file = is_file, .size = size };
     }
 

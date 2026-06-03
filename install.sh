@@ -74,6 +74,9 @@ raw_os="$(uname -s)"
 case "$raw_os" in
   Darwin*) os="macos" ;;
   Linux*)  os="linux" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    err "native Windows install is supported by install.ps1: irm https://mjgil.com/zdu/install.ps1 | iex"
+    ;;
   *)       err "unsupported OS: $raw_os" ;;
 esac
 
