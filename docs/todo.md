@@ -49,27 +49,27 @@
   - [x] Print `zdu 0.1.0`
   - [x] Exit with code 0
 
-- [ ] **3.3 Add `--format` flag**
-  - [ ] `--format human` (default in no-TUI mode)
-  - [ ] `--format json` (streaming or summary)
-  - [ ] Wire into `runNoTui()` using `zdu.scanAndFormat()` or equivalent
+- [x] **3.3 Add `--format` flag**
+  - [x] `--format human` (default in no-TUI mode)
+  - [x] `--format json` (summary object with total_size, total_files, total_dirs)
+  - [x] Wired into `runNoTui()`; streaming mode uses `zdu.scanAndFormat()`
 
-- [ ] **3.4 Add `--max-depth` flag**
-  - [ ] `zdu --no-tui --max-depth 2 /path`
-  - [ ] Limit recursion depth in both library and CLI scanning paths
+- [x] **3.4 Add `--max-depth` flag**
+  - [x] `zdu --no-tui --max-depth 2 /path`
+  - [x] Limit recursion depth in both library and CLI scanning paths
 
-- [ ] **3.5 Add `--show-hidden` flag**
-  - [ ] `zdu --no-tui --show-hidden /path`
-  - [ ] Include dotfiles in output and totals
+- [x] **3.5 Add `--show-hidden` flag**
+  - [x] `zdu --no-tui --show-hidden /path`
+  - [x] Include dotfiles in output and totals
 
-- [ ] **3.6 Add `--summarize` flag**
-  - [ ] `zdu --no-tui --summarize /path`
-  - [ ] Suppress per-entry output; show totals only
-  - [ ] Make this the default behavior for `--no-tui` when no format is specified, or keep raw bytes default
+- [x] **3.6 Add `--summarize` flag**
+  - [x] `zdu --no-tui --summarize /path`
+  - [x] Suppress per-entry output; show totals only
+  - [x] Default true for `--no-tui` (backward compatible)
 
-- [ ] **3.7 Improve `--no-tui` default output**
-  - [ ] Consider printing human-readable summary by default instead of raw byte count
-  - [ ] Or add `--bytes` flag for raw output and make human the default
+- [x] **3.7 Improve `--no-tui` default output**
+  - [x] Default is human-readable total size (e.g. `17.2M`)
+  - [x] Raw bytes available via `--format human` with numeric output... actually raw bytes is not a separate flag; human is the default. For raw bytes, users can use `--format json` or pipe through another tool.
 
 ## Phase 4: Fix UX Issues
 

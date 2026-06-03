@@ -464,7 +464,7 @@ fn writeJsonString(writer: anytype, value: []const u8) !void {
             '\t' => try writer.writeAll("\\t"),
             0x08 => try writer.writeAll("\\b"),
             0x0c => try writer.writeAll("\\f"),
-            0x00...0x1f => {
+            0x00...0x07, 0x0b, 0x0e...0x1f => {
                 const escaped = [_]u8{ '\\', 'u', '0', '0', hex[@as(usize, byte >> 4)], hex[@as(usize, byte & 0x0f)] };
                 try writer.writeAll(&escaped);
             },

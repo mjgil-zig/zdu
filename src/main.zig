@@ -3453,36 +3453,70 @@ fn runBenchmarks(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_tt
     std.debug.print("worker_thread_ms={d}\nstack_machine_ms={d}\n", .{ worker_ms, stack_ms });
 }
 
-fn runNoTui(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64, refresh_cache: bool, parallel: bool, num_threads: usize) !void {
-    const total_size = blk: {
-        if (cache_ttl_seconds > 0 or refresh_cache or parallel) {
-            const stats = try scanRootStats(io, allocator, cwd, .{
-                .cache_ttl_seconds = cache_ttl_seconds,
-                .refresh_cache = refresh_cache,
-                .parallel = parallel,
-                .num_threads = num_threads,
-            });
-            break :blk stats.size;
-        }
-
-        const result = try zdu.scan(io, .{
-            .path = cwd,
-            .format = .human,
-            .summarize = true,
-            .show_hidden = false,
-            .max_depth = null,
-            .max_entries = null,
-            .parallel = parallel,
-            .num_threads = if (num_threads == 0) 1 else num_threads,
-            .use_io_uring = false,
-        });
-        break :blk result.total_size;
-    };
-
-    var stdout_buffer: [64]u8 = undefined;
+fn runNoTui(io: std.Io, allocator: mem.Allocator, config: Config) !void {
+    var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    try stdout.print("{d}\n", .{total_size});
+
+    const use_cache_path = config.cache_ttl_seconds > 0 or config.refresh_cache or config.parallel;
+    const streaming_ok = !use_cache_path and !config.summarize;
+
+    if (streaming_ok) {
+        try zdu.scanAndFormat(io, .{
+            .path = config.cwd,
+            .format = config.format,
+            .summarize = config.summarize,
+            .show_hidden = config.show_hidden,
+            .max_depth = config.max_depth,
+            .max_entries = null,
+            .parallel = config.parallel,
+            .num_threads = if (config.num_threads == 0) 1 else config.num_threads,
+            .use_io_uring = false,
+        }, stdout);
+        try stdout.flush();
+        return;
+    }
+
+    const stats: Model.DirStats = if (use_cache_path)
+        try scanRootStats(io, allocator, config.cwd, .{
+            .cache_ttl_seconds = config.cache_ttl_seconds,
+            .refresh_cache = config.refresh_cache,
+            .parallel = config.parallel,
+            .num_threads = config.num_threads,
+        })
+    else blk: {
+        const result = try zdu.scan(io, .{
+            .path = config.cwd,
+            .format = config.format,
+            .summarize = config.summarize,
+            .show_hidden = config.show_hidden,
+            .max_depth = config.max_depth,
+            .max_entries = null,
+            .parallel = config.parallel,
+            .num_threads = if (config.num_threads == 0) 1 else config.num_threads,
+            .use_io_uring = false,
+        });
+        break :blk Model.DirStats{
+            .size = result.total_size,
+            .file_count = result.total_files,
+            .dir_count = result.total_dirs,
+        };
+    };
+
+    switch (config.format) {
+        .human => {
+            var size_buf: [32]u8 = undefined;
+            const human = formatSizeHuman(&size_buf, stats.size);
+            try stdout.print("{s}\n", .{human});
+        },
+        .json => {
+            try stdout.writeAll("{\n");
+            try stdout.print("  \"total_size\": {},\n", .{stats.size});
+            try stdout.print("  \"total_files\": {},\n", .{stats.file_count});
+            try stdout.print("  \"total_dirs\": {}\n", .{stats.dir_count});
+            try stdout.writeAll("}\n");
+        },
+    }
     try stdout.flush();
 }
 
@@ -3652,7 +3686,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (config.no_tui) {
-        try runNoTui(init.io, allocator, config.cwd, config.cache_ttl_seconds, config.refresh_cache, config.parallel, config.num_threads);
+        try runNoTui(init.io, allocator, config);
         return;
     }
 
@@ -3757,6 +3791,42 @@ test "parseArgs: -j implies parallel" {
     try std.testing.expect(config.parallel);
     try std.testing.expectEqual(@as(usize, 4), config.num_threads);
     try std.testing.expectEqualStrings("/home/user", config.cwd);
+}
+
+test "parseArgs: --format json" {
+    const args = &[_][]const u8{ "zdu", "--no-tui", "--format", "json", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.no_tui);
+    try std.testing.expectEqual(zdu.Format.json, config.format);
+    try std.testing.expectEqualStrings("/home/user", config.cwd);
+}
+
+test "parseArgs: --format human" {
+    const args = &[_][]const u8{ "zdu", "--no-tui", "--format", "human", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.no_tui);
+    try std.testing.expectEqual(zdu.Format.human, config.format);
+}
+
+test "parseArgs: --max-depth" {
+    const args = &[_][]const u8{ "zdu", "--no-tui", "--max-depth", "2", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.no_tui);
+    try std.testing.expectEqual(@as(?usize, 2), config.max_depth);
+}
+
+test "parseArgs: --show-hidden" {
+    const args = &[_][]const u8{ "zdu", "--no-tui", "--show-hidden", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.no_tui);
+    try std.testing.expect(config.show_hidden);
+}
+
+test "parseArgs: --summarize" {
+    const args = &[_][]const u8{ "zdu", "--no-tui", "--summarize", "/home/user" };
+    const config = try parseArgs(args);
+    try std.testing.expect(config.no_tui);
+    try std.testing.expect(config.summarize);
 }
 
 test "parallel scan tasks are sorted by cached file count" {
