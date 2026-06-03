@@ -88,16 +88,14 @@
 
 ## Phase 5: Library API Improvements
 
-- [ ] **5.1 Remove or implement `use_io_uring`**
-  - [ ] Option A: Remove `use_io_uring` from `Options` and all references
-  - [ ] Option B: Implement io_uring-based async directory iteration (significant effort)
-  - [ ] **Decision needed** — recommend Option A for now
+- [x] **5.1 Remove or implement `use_io_uring`**
+  - [x] Removed `use_io_uring` from `Options` and all references
 
-- [ ] **5.2 Accept allocator parameter in library functions**
-  - [ ] Change `scan()` signature: `pub fn scan(io: std.Io, allocator: mem.Allocator, opts: Options) !ScanResult`
-  - [ ] Change `scanAndFormat()` similarly
-  - [ ] Replace `std.heap.page_allocator` with passed allocator
-  - [ ] Update all callers and tests
+- [x] **5.2 Accept allocator parameter in library functions**
+  - [x] Changed `scan()` signature: `pub fn scan(io: std.Io, allocator: mem.Allocator, opts: Options) !ScanResult`
+  - [x] Changed `scanAndFormat()` similarly
+  - [x] Replaced `std.heap.page_allocator` with passed allocator
+  - [x] Updated all callers and tests
 
 - [ ] **5.3 Implement `parallel` and `num_threads` in library**
   - [ ] Have `zdu.scan()` respect `opts.parallel` and `opts.num_threads`

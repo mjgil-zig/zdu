@@ -3462,7 +3462,7 @@ fn runNoTui(io: std.Io, allocator: mem.Allocator, config: Config) !void {
     const streaming_ok = !use_cache_path and !config.summarize;
 
     if (streaming_ok) {
-        try zdu.scanAndFormat(io, .{
+        try zdu.scanAndFormat(io, allocator, .{
             .path = config.cwd,
             .format = config.format,
             .summarize = config.summarize,
@@ -3471,7 +3471,6 @@ fn runNoTui(io: std.Io, allocator: mem.Allocator, config: Config) !void {
             .max_entries = null,
             .parallel = config.parallel,
             .num_threads = if (config.num_threads == 0) 1 else config.num_threads,
-            .use_io_uring = false,
         }, stdout);
         try stdout.flush();
         return;
@@ -3485,7 +3484,7 @@ fn runNoTui(io: std.Io, allocator: mem.Allocator, config: Config) !void {
             .num_threads = config.num_threads,
         })
     else blk: {
-        const result = try zdu.scan(io, .{
+        const result = try zdu.scan(io, allocator, .{
             .path = config.cwd,
             .format = config.format,
             .summarize = config.summarize,
@@ -3494,7 +3493,6 @@ fn runNoTui(io: std.Io, allocator: mem.Allocator, config: Config) !void {
             .max_entries = null,
             .parallel = config.parallel,
             .num_threads = if (config.num_threads == 0) 1 else config.num_threads,
-            .use_io_uring = false,
         });
         break :blk Model.DirStats{
             .size = result.total_size,

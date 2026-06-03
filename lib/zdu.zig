@@ -50,7 +50,6 @@ pub const Options = struct {
     max_entries: ?usize,
     parallel: bool,
     num_threads: usize,
-    use_io_uring: bool,
 };
 
 pub const ScanResult = struct {
@@ -69,7 +68,7 @@ const ScanTotals = struct {
     entry_count: usize = 0,
 };
 
-pub fn scanAndFormat(io: std.Io, opts: Options, writer: anytype) !void {
+pub fn scanAndFormat(io: std.Io, allocator: mem.Allocator, opts: Options, writer: anytype) !void {
     if (isGeneratedDirPath(opts.path)) {
         switch (opts.format) {
             .human => try writer.writeAll("Entries:\n\nSummary:\n  Total size: 0\n  Files: 0\n  Directories: 0\n  Scan time: 0ms\n  Errors: 0\n"),
@@ -78,7 +77,6 @@ pub fn scanAndFormat(io: std.Io, opts: Options, writer: anytype) !void {
         return;
     }
 
-    const allocator = std.heap.page_allocator;
     var totals: ScanTotals = .{};
     var first_json_entry = true;
 
@@ -131,7 +129,7 @@ pub fn scanAndFormat(io: std.Io, opts: Options, writer: anytype) !void {
     }
 }
 
-pub fn scan(io: std.Io, opts: Options) !ScanResult {
+pub fn scan(io: std.Io, allocator: mem.Allocator, opts: Options) !ScanResult {
     if (isGeneratedDirPath(opts.path)) {
         return .{
             .total_size = 0,
@@ -142,7 +140,6 @@ pub fn scan(io: std.Io, opts: Options) !ScanResult {
         };
     }
 
-    const allocator = std.heap.page_allocator;
     const start = std.Io.Timestamp.now(io, .awake);
     var totals: ScanTotals = .{};
 
@@ -497,7 +494,6 @@ test "Options defaults" {
         .max_entries = null,
         .parallel = false,
         .num_threads = 1,
-        .use_io_uring = false,
     };
     try std.testing.expect(!opts.parallel);
     try std.testing.expectEqual(@as(usize, 1), opts.num_threads);
@@ -522,7 +518,7 @@ test "ScanResult init" {
 }
 
 test "scan skips /proc entirely" {
-    const result = try scan(std.testing.io, .{
+    const result = try scan(std.testing.io, std.testing.allocator, .{
         .path = "/proc",
         .format = .human,
         .summarize = false,
@@ -531,7 +527,6 @@ test "scan skips /proc entirely" {
         .max_entries = null,
         .parallel = false,
         .num_threads = 1,
-        .use_io_uring = false,
     });
 
     try std.testing.expectEqual(@as(u64, 0), result.total_size);
