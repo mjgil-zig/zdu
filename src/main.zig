@@ -1493,6 +1493,7 @@ pub const Model = struct {
 
     fn windowsPathNeedsDotPrefix(path: []const u8) bool {
         if (path.len == 0) return false;
+        if (mem.eql(u8, path, ".") or mem.eql(u8, path, "..")) return false;
         if (path[0] == '\\' or path[0] == '/') return false;
         if (path.len >= 2 and path[1] == ':') return false;
         return true;
@@ -2784,6 +2785,8 @@ test "directory size xattr round trip" {
 test "Windows ADS relative paths get explicit current-directory prefix" {
     try std.testing.expect(Model.windowsPathNeedsDotPrefix("relative"));
     try std.testing.expect(Model.windowsPathNeedsDotPrefix("relative\\path"));
+    try std.testing.expect(!Model.windowsPathNeedsDotPrefix("."));
+    try std.testing.expect(!Model.windowsPathNeedsDotPrefix(".."));
     try std.testing.expect(!Model.windowsPathNeedsDotPrefix("C:\\absolute"));
     try std.testing.expect(!Model.windowsPathNeedsDotPrefix("/absolute"));
     try std.testing.expect(!Model.windowsPathNeedsDotPrefix("\\\\server\\share"));
