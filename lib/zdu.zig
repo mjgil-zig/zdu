@@ -385,14 +385,13 @@ fn entryKindAndSize(
     }
 
     if (comptime have_posix_stat) {
-        const stat = cStatAt(dir, name) orelse {
-            error_count.* += 1;
-            return .{ .is_dir = false, .is_file = initial_kind == .file, .size = 0 };
-        };
-        const is_dir = posixStatIsDirectory(stat);
-        const is_file = posixStatIsRegular(stat);
-        const size = posixStatAllocatedSize(stat);
-        return .{ .is_dir = is_dir, .is_file = is_file, .size = size };
+        if (cStatAt(dir, name)) |stat| {
+            const is_dir = posixStatIsDirectory(stat);
+            const is_file = posixStatIsRegular(stat);
+            const size = posixStatAllocatedSize(stat);
+            return .{ .is_dir = is_dir, .is_file = is_file, .size = size };
+        }
+        // Fall through to statFile fallback; don't increment error_count yet
     }
 
     const stat = dir.statFile(io, name, .{ .follow_symlinks = false }) catch {
@@ -672,9 +671,6 @@ fn scanParallel(
 }
 
 test "scan parallel produces same results as serial" {
-    // TODO: investigate why this fails on Windows native CI runners
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -729,9 +725,6 @@ test "scan parallel produces same results as serial" {
 }
 
 test "scan respects show_hidden" {
-    // TODO: investigate why this fails on macOS x86_64 CI runners
-    if (builtin.os.tag == .macos and builtin.cpu.arch == .x86_64) return error.SkipZigTest;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -774,9 +767,6 @@ test "scan respects show_hidden" {
 }
 
 test "scan respects max_depth" {
-    // TODO: investigate why this fails on macOS x86_64 CI runners
-    if (builtin.os.tag == .macos and builtin.cpu.arch == .x86_64) return error.SkipZigTest;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
