@@ -127,15 +127,15 @@
 
 ## Phase 7: Documentation
 
-- [ ] **7.1 Update README**
-  - [ ] Document `--help`, `--version`
-  - [ ] Document `--format json`
-  - [ ] Document `--max-depth`, `--show-hidden`
-  - [ ] Document `--bench` (or remove it)
-  - [ ] Add example outputs for `--no-tui` modes
+- [x] **7.1 Update README**
+  - [x] Document `--help`, `--version`
+  - [x] Document `--format json`
+  - [x] Document `--max-depth`, `--show-hidden`
+  - [x] Document `--bench`
+  - [x] Add example outputs for `--no-tui` modes
 
-- [ ] **7.2 Add CHANGELOG.md**
-  - [ ] Track versions and features
+- [x] **7.2 Add CHANGELOG.md**
+  - [x] Track versions and features
 
 - [ ] **7.3 Add man page or generate from `--help`**
   - [ ] Optional: use a tool like `help2man` in CI

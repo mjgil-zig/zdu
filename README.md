@@ -1,5 +1,7 @@
 # zdu
 
+A fast, low-memory disk usage analyzer with an interactive TUI and a scriptable CLI.
+
 ## Installation
 
 ### macOS and Linux
@@ -32,6 +34,86 @@ The Windows installer downloads the native `zdu-<arch>-windows.zip` release asse
 | 10M files | **~8.2 MB** | **2 GB+** |
 
 The TUI keeps the visible directory entries for the current directory. During the initial loading scan it fills those entries in place; it no longer keeps a separate pending-entry list or a second finalized-entry list.
+
+## CLI Reference
+
+```
+Usage: zdu [options] [path]
+
+Options:
+  -h, --help              Show this help message and exit
+  -v, --version           Show version and exit
+  --no-tui                Print total size and exit (no interactive UI)
+  --format <human|json>   Output format for --no-tui (default: human)
+  --max-depth <n>         Limit recursion depth
+  --show-hidden           Include dotfiles in output
+  --summarize             Show totals only (default for --no-tui)
+  --cache-ttl [seconds]   Trust cached stats within TTL (default 60s if no value)
+  --refresh-cache         Recompute and rewrite cache entries
+  --parallel              Enable parallel directory scanning
+  --jobs, -j <n>          Number of parallel workers (implies --parallel)
+  --bench                 Run benchmark and exit
+```
+
+### Examples
+
+**Interactive TUI (default)**
+```bash
+zdu
+zdu /home/user/git
+```
+
+**Quick size check**
+```bash
+zdu --no-tui /home/user/git
+# 17.2M
+```
+
+**JSON output**
+```bash
+zdu --no-tui --format json /home/user/git
+# {
+#   "total_size": 18022400,
+#   "total_files": 1423,
+#   "total_dirs": 87
+# }
+```
+
+**Limit recursion depth**
+```bash
+zdu --no-tui --max-depth 2 /home/user/git
+```
+
+**Include hidden files**
+```bash
+zdu --no-tui --show-hidden /home/user/git
+```
+
+**Show per-entry breakdown**
+```bash
+zdu --no-tui --format human --summarize=false /home/user/git
+# Entries:
+#   src/          8.4M
+#   lib/          3.1M
+#   docs/         1.2M
+#
+# Summary:
+#   Total size: 17.2M
+#   Files: 1423
+#   Directories: 87
+```
+
+**Parallel scan with cache refresh**
+```bash
+zdu --no-tui --parallel --jobs 8 --refresh-cache --cache-ttl 1800 /path/to/scan
+```
+
+**Benchmark mode**
+```bash
+zdu --bench /home/user/git
+# worker_thread_ms=1150
+# stack_machine_ms=1230
+```
 
 ## Cache behavior
 
@@ -80,7 +162,7 @@ Deleting a file or directory updates cached parent directory stats by subtractin
 
 If a parent directory has neither loaded summary stats nor a readable cache record, that parent cache update is skipped instead of forcing a recompute.
 
-The delete confirmation prompt highlights the uppercase `Y` in `[Y/n]`; pressing uppercase `Y` confirms, `Enter` confirms, and lowercase `n` cancels.
+The delete confirmation prompt highlights the uppercase `Y` in `[Y/n]`; pressing uppercase `Y` confirms, `Enter` confirms, lowercase `n` cancels, and `Escape` cancels.
 
 ## Parallel cache refresh
 
@@ -105,13 +187,3 @@ This is most useful with a warm v3 cache, because cached file counts give the sc
 `zdu` computes directory sizes and recursive file counts, stores them in the metadata cache, and then reuses those records for navigation and weighted parallel scheduling.
 
 The library API is summary-oriented: `scan()` returns totals without retaining per-entry names or paths, and `scanAndFormat()` streams entry output directly to the supplied writer.
-
-## CLI
-
-- `zdu [path]`
-- `zdu --cache-ttl 300 [path]`
-- `zdu --cache-ttl [path]` (defaults to 60s)
-- `zdu --no-tui [path]`
-- `zdu --no-tui --refresh-cache --cache-ttl 1800 [path]`
-- `zdu --no-tui --parallel --jobs 8 --refresh-cache --cache-ttl 1800 [path]`
-- `zdu --parallel --jobs 8 --refresh-cache --cache-ttl 1800 [path]`
