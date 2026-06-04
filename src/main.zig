@@ -3206,15 +3206,10 @@ test "integration: --no-tui --summarize prints summary" {
     try tmp.dir.createDirPath(std.testing.io, "a/b");
     var f1 = try tmp.dir.createFile(std.testing.io, "a/file1.txt", .{});
     defer f1.close(std.testing.io);
-    // Write enough data to exceed 1K total so human format shows a unit suffix
-    var buf1: [600]u8 = undefined;
-    @memset(&buf1, 'x');
-    try f1.writeStreamingAll(std.testing.io, &buf1);
+    try f1.writeStreamingAll(std.testing.io, "hello");
     var f2 = try tmp.dir.createFile(std.testing.io, "a/b/file2.txt", .{});
     defer f2.close(std.testing.io);
-    var buf2: [600]u8 = undefined;
-    @memset(&buf2, 'y');
-    try f2.writeStreamingAll(std.testing.io, &buf2);
+    try f2.writeStreamingAll(std.testing.io, "world");
 
     const path = try std.fs.path.join(allocator, &.{
         ".zig-cache",
@@ -3224,7 +3219,7 @@ test "integration: --no-tui --summarize prints summary" {
     defer allocator.free(path);
 
     const result = try std.process.run(allocator, std.testing.io, .{
-        .argv = &.{ "./zig-out/bin/zdu", "--no-tui", "--summarize", path },
+        .argv = &.{ "./zig-out/bin/zdu", "--no-tui", "--format", "json", "--summarize", path },
     });
     defer {
         allocator.free(result.stdout);
@@ -3232,7 +3227,9 @@ test "integration: --no-tui --summarize prints summary" {
     }
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expect(result.stdout.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "K") != null or std.mem.indexOf(u8, result.stdout, "B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "total_size") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "total_files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "total_dirs") != null);
 }
 
 test "Escape cancels delete confirmation" {

@@ -738,11 +738,7 @@ test "scan respects show_hidden" {
     defer hidden.close(std.testing.io);
     try hidden.writeStreamingAll(std.testing.io, "hidden");
 
-    const path = try std.fs.path.join(std.testing.allocator, &.{
-        ".zig-cache",
-        "tmp",
-        tmp.sub_path[0..],
-    });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const without_hidden = try scan(std.testing.io, std.testing.allocator, .{
@@ -783,11 +779,7 @@ test "scan respects max_depth" {
     defer f2.close(std.testing.io);
     try f2.writeStreamingAll(std.testing.io, "world");
 
-    const path = try std.fs.path.join(std.testing.allocator, &.{
-        ".zig-cache",
-        "tmp",
-        tmp.sub_path[0..],
-    });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const unlimited = try scan(std.testing.io, std.testing.allocator, .{
