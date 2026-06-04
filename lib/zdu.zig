@@ -722,6 +722,18 @@ test "scan parallel produces same results as serial" {
         .num_threads = 4,
     });
 
+    std.debug.print("path={s} serial={{.total_size={}, .total_files={}, .total_dirs={}, .error_count={}}} parallel={{.total_size={}, .total_files={}, .total_dirs={}, .error_count={}}}\n", .{
+        path,
+        serial.total_size,
+        serial.total_files,
+        serial.total_dirs,
+        serial.error_count,
+        parallel.total_size,
+        parallel.total_files,
+        parallel.total_dirs,
+        parallel.error_count,
+    });
+
     try std.testing.expectEqual(serial.total_size, parallel.total_size);
     try std.testing.expectEqual(serial.total_files, parallel.total_files);
     try std.testing.expectEqual(serial.total_dirs, parallel.total_dirs);
