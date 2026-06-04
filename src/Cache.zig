@@ -670,4 +670,3 @@ pub fn clearCachedDirSize(path: []const u8, allocator: mem.Allocator) void {
 pub fn clearCachedDirStats(path: []const u8, allocator: mem.Allocator) void {
     clearCachedDirSize(path, allocator);
 }
-

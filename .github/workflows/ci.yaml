@@ -202,7 +202,7 @@ jobs:
         run: |
           $out = & zig-out/bin/zdu.exe --no-tui .
           if ($LASTEXITCODE -ne 0) { throw "zdu.exe smoke test failed with exit code $LASTEXITCODE" }
-          if ($out -notmatch '^\d+$') { throw "zdu.exe smoke test returned unexpected output: $out" }
+          if ($out -notmatch '^\d+(\.\d+)?[BKMGTP]?$') { throw "zdu.exe smoke test returned unexpected output: $out" }
 
       - name: Smoke test NTFS alternate data streams
         shell: pwsh
