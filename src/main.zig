@@ -3169,3 +3169,126 @@ test "model does not process /proc" {
     try std.testing.expectEqual(@as(usize, 0), model.entries.len);
     try std.testing.expect(model.loading == null);
 }
+
+test "integration: --help prints usage" {
+    const allocator = std.testing.allocator;
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "./zig-out/bin/zdu", "--help" },
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Usage:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "--no-tui") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "--version") != null);
+}
+
+test "integration: --version prints version" {
+    const allocator = std.testing.allocator;
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "./zig-out/bin/zdu", "--version" },
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "zdu") != null);
+}
+
+test "integration: --no-tui --summarize prints summary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "a/b");
+    var f1 = try tmp.dir.createFile(std.testing.io, "a/file1.txt", .{});
+    defer f1.close(std.testing.io);
+    try f1.writeStreamingAll(std.testing.io, "hello");
+    var f2 = try tmp.dir.createFile(std.testing.io, "a/b/file2.txt", .{});
+    defer f2.close(std.testing.io);
+    try f2.writeStreamingAll(std.testing.io, "world");
+
+    const path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer allocator.free(path);
+
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "./zig-out/bin/zdu", "--no-tui", "--summarize", path },
+    });
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "K") != null or std.mem.indexOf(u8, result.stdout, "B") != null);
+}
+
+test "Escape cancels delete confirmation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try zduTestWriteFile(&tmp, "victim.txt", "delete me");
+
+    const root_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root_path);
+
+    const model = try Model.init(std.testing.io, std.testing.allocator, root_path);
+    defer model.deinit();
+
+    model.selected = findEntryIndex(model, "victim.txt") orelse return error.SkipZigTest;
+    try model.deleteSelected();
+    try std.testing.expect(model.confirm_delete != null);
+
+    var ctx = testEventContext(std.testing.allocator, std.testing.io);
+    defer ctx.cmds.deinit(std.testing.allocator);
+
+    try model.handleEvent(&ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
+
+    try std.testing.expect(model.confirm_delete == null);
+    try std.testing.expect(ctx.redraw);
+
+    // File should still exist
+    const victim_check_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "victim.txt" });
+    defer std.testing.allocator.free(victim_check_path);
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, victim_check_path, .{});
+}
+
+test "right-click on directory opens delete confirmation" {
+    var entries = [_]Model.Entry{
+        .{ .name = @constCast(""), .path = @constCast("/tmp"), .size = 10, .is_dir = true, .role = .summary },
+        .{ .name = @constCast("subdir"), .path = @constCast("/tmp/subdir"), .size = 5, .is_dir = true, .file_count = 0, .dir_count = 1 },
+    };
+    var model: Model = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .cwd = "",
+        .entries = entries[0..],
+        .selected = 1,
+        .last_visible_rows = 2,
+    };
+
+    var ctx = testEventContext(std.testing.allocator, std.testing.io);
+    defer ctx.cmds.deinit(std.testing.allocator);
+
+    try model.handleEvent(&ctx, .{ .mouse = .{
+        .type = .press,
+        .button = .right,
+        .row = 3,
+        .col = 0,
+        .mods = .{},
+    } });
+
+    try std.testing.expect(model.confirm_delete != null);
+    try std.testing.expect(model.confirm_delete.?.is_dir);
+    try std.testing.expect(ctx.redraw);
+
+    // Clean up allocated confirm_delete path
+    model.cancelDelete();
+}

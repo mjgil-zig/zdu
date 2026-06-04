@@ -724,3 +724,144 @@ test "scan parallel produces same results as serial" {
     try std.testing.expectEqual(serial.total_dirs, parallel.total_dirs);
     try std.testing.expectEqual(serial.error_count, parallel.error_count);
 }
+
+test "scan respects show_hidden" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "visible");
+    var visible = try tmp.dir.createFile(std.testing.io, "visible.txt", .{});
+    defer visible.close(std.testing.io);
+    try visible.writeStreamingAll(std.testing.io, "visible");
+
+    var hidden = try tmp.dir.createFile(std.testing.io, ".hidden.txt", .{});
+    defer hidden.close(std.testing.io);
+    try hidden.writeStreamingAll(std.testing.io, "hidden");
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer std.testing.allocator.free(path);
+
+    const without_hidden = try scan(std.testing.io, std.testing.allocator, .{
+        .path = path,
+        .format = .human,
+        .summarize = true,
+        .show_hidden = false,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+    });
+
+    const with_hidden = try scan(std.testing.io, std.testing.allocator, .{
+        .path = path,
+        .format = .human,
+        .summarize = true,
+        .show_hidden = true,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+    });
+
+    try std.testing.expect(with_hidden.total_files > without_hidden.total_files);
+    try std.testing.expect(with_hidden.total_size > without_hidden.total_size);
+}
+
+test "scan respects max_depth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "a/b");
+    var f1 = try tmp.dir.createFile(std.testing.io, "a/file1.txt", .{});
+    defer f1.close(std.testing.io);
+    try f1.writeStreamingAll(std.testing.io, "hello");
+    var f2 = try tmp.dir.createFile(std.testing.io, "a/b/file2.txt", .{});
+    defer f2.close(std.testing.io);
+    try f2.writeStreamingAll(std.testing.io, "world");
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer std.testing.allocator.free(path);
+
+    const unlimited = try scan(std.testing.io, std.testing.allocator, .{
+        .path = path,
+        .format = .human,
+        .summarize = true,
+        .show_hidden = true,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+    });
+
+    const depth1 = try scan(std.testing.io, std.testing.allocator, .{
+        .path = path,
+        .format = .human,
+        .summarize = true,
+        .show_hidden = true,
+        .max_depth = 1,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+    });
+
+    try std.testing.expect(unlimited.total_files > depth1.total_files);
+    try std.testing.expect(unlimited.total_dirs > depth1.total_dirs);
+}
+
+test "scanAndFormat produces valid JSON" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "subdir");
+    var f = try tmp.dir.createFile(std.testing.io, "subdir/file.txt", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, "data");
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer std.testing.allocator.free(path);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+
+    const writer_wrapper = struct {
+        list: *std.ArrayList(u8),
+        pub fn writeAll(self: @This(), data: []const u8) !void {
+            try self.list.appendSlice(std.testing.allocator, data);
+        }
+        pub fn print(self: @This(), comptime fmt: []const u8, args: anytype) !void {
+            const formatted = try std.fmt.allocPrint(std.testing.allocator, fmt, args);
+            defer std.testing.allocator.free(formatted);
+            try self.list.appendSlice(std.testing.allocator, formatted);
+        }
+    }{ .list = &output };
+
+    try scanAndFormat(std.testing.io, std.testing.allocator, .{
+        .path = path,
+        .format = .json,
+        .summarize = true,
+        .show_hidden = true,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+    }, writer_wrapper);
+
+    const json = output.items;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_size\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_files\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_dirs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_time_ms\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"error_count\"") != null);
+}

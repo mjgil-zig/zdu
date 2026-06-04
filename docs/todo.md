@@ -106,24 +106,24 @@
 
 ## Phase 6: Testing & Quality
 
-- [ ] **6.1 Add integration tests**
-  - [ ] Build the binary in a test step
-  - [ ] Run `zdu --no-tui` on a known directory tree and assert output
-  - [ ] Run `zdu --help` and assert it contains expected text
-  - [ ] Run `zdu --version` and assert it matches expected version
+- [x] **6.1 Add integration tests**
+  - [x] Build the binary in a test step
+  - [x] Run `zdu --no-tui` on a known directory tree and assert output
+  - [x] Run `zdu --help` and assert it contains expected text
+  - [x] Run `zdu --version` and assert it matches expected version
 
-- [ ] **6.2 Add library API tests**
-  - [ ] Test `zdu.scan()` with `--show-hidden` false/true
-  - [ ] Test `zdu.scan()` with `--max-depth`
-  - [ ] Test `zdu.scanAndFormat()` JSON output structure
+- [x] **6.2 Add library API tests**
+  - [x] Test `zdu.scan()` with `--show-hidden` false/true
+  - [x] Test `zdu.scan()` with `--max-depth`
+  - [x] Test `zdu.scanAndFormat()` JSON output structure
 
-- [ ] **6.3 Add delete confirmation tests**
-  - [ ] Test Escape cancels delete
-  - [ ] Test right-click on directory opens confirmation (not immediate delete)
+- [x] **6.3 Add delete confirmation tests**
+  - [x] Test Escape cancels delete
+  - [x] Test right-click on directory opens confirmation (not immediate delete)
 
-- [ ] **6.4 Verify no regression in existing tests**
-  - [ ] All 60+ existing tests still pass after refactors
-  - [ ] Cross-platform tests still skip appropriately
+- [x] **6.4 Verify no regression in existing tests**
+  - [x] All 60+ existing tests still pass after refactors
+  - [x] Cross-platform tests still skip appropriately
 
 ## Phase 7: Documentation
 

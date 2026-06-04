@@ -37,6 +37,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_app_tests.step);
     test_step.dependOn(&run_lib_tests.step);
 
+    // Integration tests depend on the binary being built first
+    const install_step = b.getInstallStep();
+    run_app_tests.step.dependOn(install_step);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
