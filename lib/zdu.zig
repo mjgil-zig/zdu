@@ -657,16 +657,22 @@ fn scanParallel(
 
         threads[i] = try std.Thread.spawn(.{}, struct {
             fn run(ctx: *ThreadCtx) void {
+                std.debug.print("thread start={d} end={d}\n", .{ ctx.start, ctx.end });
                 for (ctx.subdirs[ctx.start..ctx.end]) |sd| {
+                    std.debug.print("thread opening {s}\n", .{sd.name});
                     var subdir = ctx.dir.openDir(ctx.io, sd.name, .{
                         .iterate = true,
                         .follow_symlinks = false,
-                    }) catch continue;
+                    }) catch |e| {
+                        std.debug.print("thread openDir failed for {s}: {s}\n", .{ sd.name, @errorName(e) });
+                        continue;
+                    };
                     defer subdir.close(ctx.io);
                     var subiter = subdir.iterate();
                     walkDirTotals(ctx.allocator, ctx.io, ctx.opts, sd.full_path, ctx.check_gen, subdir, &subiter, 1, &ctx.result) catch {
                         ctx.result.error_count += 1;
                     };
+                    std.debug.print("thread done with {s}: size={d} files={d} dirs={d}\n", .{ sd.name, ctx.result.total_size, ctx.result.total_files, ctx.result.total_dirs });
                 }
             }
         }.run, .{&contexts[i]});
@@ -676,7 +682,8 @@ fn scanParallel(
 
     for (threads) |thread| thread.join();
 
-    for (contexts) |ctx| {
+    for (contexts, 0..) |ctx, i| {
+        std.debug.print("context[{d}] result: size={d} files={d} dirs={d}\n", .{ i, ctx.result.total_size, ctx.result.total_files, ctx.result.total_dirs });
         totals.total_size += ctx.result.total_size;
         totals.total_files += ctx.result.total_files;
         totals.total_dirs += ctx.result.total_dirs;
