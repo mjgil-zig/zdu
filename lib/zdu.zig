@@ -383,6 +383,10 @@ fn entryKindAndSize(
     if (initial_kind == .directory) {
         return .{ .is_dir = true, .is_file = false, .size = 0 };
     }
+    if (initial_kind == .file) {
+        const size = fileSizeOnDiskAt(dir, name, io);
+        return .{ .is_dir = false, .is_file = true, .size = size };
+    }
 
     if (comptime have_posix_stat) {
         if (cStatAt(dir, name)) |stat| {
