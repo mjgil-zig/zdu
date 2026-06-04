@@ -4,6 +4,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const zdu = @import("zdu");
 const Cache = @import("Cache.zig");
+const Scan = @import("Scan.zig");
 const mem = std.mem;
 
 const have_posix_stat = builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos);
@@ -158,6 +159,7 @@ pub const Model = struct {
     const CachedDirSize = Cache.CachedDirSize;
     const CachedDirStats = Cache.CachedDirStats;
     const DirStats = Cache.DirStats;
+    const DynamicScanInput = Scan.DynamicScanInput;
 
     pub const Options = struct {
         cache_ttl_seconds: u64 = 0,
@@ -196,11 +198,6 @@ pub const Model = struct {
         total: DirStats = .{ .dir_count = 1 },
     };
 
-    const CachedOrOpenDir = union(enum) {
-        cached_stats: DirStats,
-        dir: std.Io.Dir,
-    };
-
     const EntryScanTask = struct {
         path: []u8,
         entry_index: usize,
@@ -221,49 +218,6 @@ pub const Model = struct {
     const dynamic_split_min_files: u64 = 4096;
     const dynamic_wait_sleep_ns: u64 = 100_000;
     const dynamic_worker_stack_size: usize = 3 * 1024 * 1024;
-
-    const DynamicScanInput = struct {
-        path: []const u8,
-        estimate_files: u64,
-    };
-
-    const DynamicScanFuture = struct {
-        mutex: std.Io.Mutex = .init,
-        done: bool = false,
-        stats: DirStats = .{},
-    };
-
-    const DynamicScanTask = struct {
-        path: []u8,
-        estimate_files: u64,
-        future: *DynamicScanFuture,
-    };
-
-    const DynamicWork = union(enum) {
-        task: DynamicScanTask,
-        wait,
-        done,
-    };
-
-    const DynamicScanContext = struct {
-        io: std.Io,
-        allocator: mem.Allocator,
-        cache_ttl_seconds: u64,
-        refresh_cache: bool,
-        worker_count: usize,
-        split_threshold_files: u64 = dynamic_split_min_files,
-        tasks: std.ArrayList(DynamicScanTask) = .empty,
-        active_tasks: usize = 0,
-        mutex: std.Io.Mutex = .init,
-    };
-
-    const DynamicFrame = struct {
-        path: []u8,
-        dir: std.Io.Dir,
-        iter: std.Io.Dir.Iterator,
-        total: DirStats = .{ .dir_count = 1 },
-        pending: std.ArrayList(*DynamicScanFuture) = .empty,
-    };
 
     const Loading = struct {
         processed: usize = 0,
@@ -322,31 +276,6 @@ pub const Model = struct {
         };
     }
 
-    fn fileEntryStats(size: u64) DirStats {
-        return .{ .size = size, .file_count = 1, .dir_count = 0 };
-    }
-
-    fn dirEntryStats(size: u64, file_count: u64, dir_count: u64) DirStats {
-        return .{ .size = size, .file_count = file_count, .dir_count = dir_count };
-    }
-
-    fn addStats(total: *DirStats, value: DirStats) void {
-        total.size += value.size;
-        total.file_count += value.file_count;
-        total.dir_count += value.dir_count;
-    }
-
-    fn subtractStats(total: DirStats, value: DirStats) ?DirStats {
-        if (value.size > total.size) return null;
-        if (value.file_count > total.file_count) return null;
-        if (value.dir_count > total.dir_count) return null;
-        return .{
-            .size = total.size - value.size,
-            .file_count = total.file_count - value.file_count,
-            .dir_count = total.dir_count - value.dir_count,
-        };
-    }
-
     fn statsFromEntry(entry: Entry) DirStats {
         if (entry.is_dir) {
             return .{
@@ -367,26 +296,6 @@ pub const Model = struct {
             .entry_index = entry_index,
             .total = .{ .dir_count = 1 },
         });
-    }
-
-    fn pushDirStatsFrame(stack: *std.ArrayList(StackFrame), allocator: mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
-        var owned_dir = dir;
-        errdefer owned_dir.close(io);
-        try stack.append(allocator, .{
-            .dir = owned_dir,
-            .iter = owned_dir.iterateAssumeFirstIteration(),
-        });
-    }
-
-    fn openChildDirForScan(parent_dir: std.Io.Dir, io: std.Io, name: []const u8, cache_ttl_seconds: u64, read_cache: bool) ?CachedOrOpenDir {
-        var dir = parent_dir.openDir(io, name, .{ .iterate = true }) catch return null;
-        if (read_cache and cache_ttl_seconds > 0) {
-            if (Cache.readCachedDirStatsFd(dir)) |cached_stats| {
-                dir.close(io);
-                return .{ .cached_stats = cached_stats };
-            }
-        }
-        return .{ .dir = dir };
     }
 
     pub fn init(io: std.Io, allocator: mem.Allocator, cwd: []const u8) !*Model {
@@ -500,7 +409,7 @@ pub const Model = struct {
     fn totalItemStats(entries: []const Entry) DirStats {
         var total: DirStats = .{};
         for (entries) |entry| {
-            if (entry.role == .item) addStats(&total, statsFromEntry(entry));
+            if (entry.role == .item) Scan.addStats(&total, statsFromEntry(entry));
         }
         return total;
     }
@@ -543,17 +452,17 @@ pub const Model = struct {
                     defer model.allocator.free(full_path);
                     if (zdu.isGeneratedDirPath(full_path)) continue;
                     if (model.refresh_cache) {
-                        break :blk computeDirStatsRefreshing(full_path, model.allocator, model.io, model.cache_ttl_seconds);
+                        break :blk Scan.computeDirStatsRefreshing(full_path, model.allocator, model.io, model.cache_ttl_seconds);
                     }
                     break :blk Cache.readCachedDirStats(full_path, model.allocator) orelse .{};
-                } else fileEntryStats(fileSizeOnDiskAt(dir, entry.name, model.io)),
+                } else Scan.fileEntryStats(Scan.fileSizeOnDiskAt(dir, entry.name, model.io)),
                 .loading => blk: {
                     if (is_dir) {
                         const full_path = try std.fs.path.join(model.allocator, &.{ model.cwd, entry.name });
                         defer model.allocator.free(full_path);
                         if (zdu.isGeneratedDirPath(full_path)) continue;
                     }
-                    break :blk if (is_dir) DirStats{} else fileEntryStats(0);
+                    break :blk if (is_dir) DirStats{} else Scan.fileEntryStats(0);
                 },
             };
 
@@ -583,9 +492,9 @@ pub const Model = struct {
             if (zdu.isGeneratedDirPath(full_path)) continue;
 
             _ = if (model.refresh_cache)
-                computeDirStatsRefreshing(full_path, model.allocator, model.io, model.cache_ttl_seconds)
+                Scan.computeDirStatsRefreshing(full_path, model.allocator, model.io, model.cache_ttl_seconds)
             else
-                computeDirStats(full_path, model.allocator, model.io, model.cache_ttl_seconds);
+                Scan.computeDirStats(full_path, model.allocator, model.io, model.cache_ttl_seconds);
         }
     }
 
@@ -596,288 +505,6 @@ pub const Model = struct {
                 return mem.lessThan(u8, a.path, b.path);
             }
         }.less);
-    }
-
-    fn dynamicTaskLess(a: DynamicScanTask, b: DynamicScanTask) bool {
-        if (a.estimate_files != b.estimate_files) return a.estimate_files > b.estimate_files;
-        return mem.lessThan(u8, a.path, b.path);
-    }
-
-    fn deinitDynamicContext(ctx: *DynamicScanContext) void {
-        for (ctx.tasks.items) |task| ctx.allocator.free(task.path);
-        ctx.tasks.deinit(ctx.allocator);
-    }
-
-    fn enqueueDynamicTask(ctx: *DynamicScanContext, path: []u8, future: *DynamicScanFuture, estimate_files: u64) bool {
-        ctx.mutex.lockUncancelable(ctx.io);
-        defer ctx.mutex.unlock(ctx.io);
-
-        ctx.tasks.append(ctx.allocator, .{
-            .path = path,
-            .estimate_files = estimate_files,
-            .future = future,
-        }) catch return false;
-        return true;
-    }
-
-    fn takeDynamicWork(ctx: *DynamicScanContext) DynamicWork {
-        ctx.mutex.lockUncancelable(ctx.io);
-        defer ctx.mutex.unlock(ctx.io);
-
-        if (ctx.tasks.items.len > 0) {
-            var best_index: usize = 0;
-            var i: usize = 1;
-            while (i < ctx.tasks.items.len) : (i += 1) {
-                if (dynamicTaskLess(ctx.tasks.items[i], ctx.tasks.items[best_index])) best_index = i;
-            }
-            const task = ctx.tasks.swapRemove(best_index);
-            ctx.active_tasks += 1;
-            return .{ .task = task };
-        }
-
-        if (ctx.active_tasks == 0) return .done;
-        return .wait;
-    }
-
-    fn finishDynamicTask(ctx: *DynamicScanContext) void {
-        ctx.mutex.lockUncancelable(ctx.io);
-        defer ctx.mutex.unlock(ctx.io);
-
-        if (ctx.active_tasks > 0) ctx.active_tasks -= 1;
-    }
-
-    fn completeDynamicFuture(io: std.Io, future: *DynamicScanFuture, stats: DirStats) void {
-        future.mutex.lockUncancelable(io);
-        defer future.mutex.unlock(io);
-
-        future.stats = stats;
-        future.done = true;
-    }
-
-    fn readDynamicFuture(io: std.Io, future: *DynamicScanFuture) ?DirStats {
-        future.mutex.lockUncancelable(io);
-        defer future.mutex.unlock(io);
-
-        if (!future.done) return null;
-        return future.stats;
-    }
-
-    fn dynamicWorkPressure(ctx: *DynamicScanContext) usize {
-        ctx.mutex.lockUncancelable(ctx.io);
-        defer ctx.mutex.unlock(ctx.io);
-
-        return ctx.tasks.items.len + ctx.active_tasks;
-    }
-
-    fn shouldSplitDynamicChild(ctx: *DynamicScanContext, estimate_files: u64) bool {
-        if (ctx.worker_count <= 1) return false;
-        if (estimate_files >= ctx.split_threshold_files and estimate_files > 0) return true;
-        return dynamicWorkPressure(ctx) < ctx.worker_count;
-    }
-
-    fn cleanupDynamicFrame(frame: *DynamicFrame, allocator: mem.Allocator, io: std.Io) void {
-        for (frame.pending.items) |future| allocator.destroy(future);
-        frame.pending.deinit(allocator);
-        frame.dir.close(io);
-        allocator.free(frame.path);
-    }
-
-    fn pushDynamicFrame(stack: *std.ArrayList(DynamicFrame), allocator: mem.Allocator, io: std.Io, path: []u8, dir: std.Io.Dir) bool {
-        var owned_dir = dir;
-        stack.append(allocator, .{
-            .path = path,
-            .dir = owned_dir,
-            .iter = owned_dir.iterateAssumeFirstIteration(),
-        }) catch {
-            owned_dir.close(io);
-            allocator.free(path);
-            return false;
-        };
-        return true;
-    }
-
-    fn waitDynamicFuture(ctx: *DynamicScanContext, future: *DynamicScanFuture) DirStats {
-        while (true) {
-            if (readDynamicFuture(ctx.io, future)) |stats| return stats;
-
-            switch (takeDynamicWork(ctx)) {
-                .task => |task| runDynamicTask(ctx, task),
-                .wait => _ = ctx.io.sleep(.fromNanoseconds(dynamic_wait_sleep_ns), .awake) catch {},
-                .done => return .{},
-            }
-        }
-    }
-
-    fn completeDynamicFrame(ctx: *DynamicScanContext, frame: *DynamicFrame) DirStats {
-        for (frame.pending.items) |future| {
-            const stats = waitDynamicFuture(ctx, future);
-            addStats(&frame.total, stats);
-            ctx.allocator.destroy(future);
-        }
-        Cache.writeCachedDirStatsFd(frame.dir, frame.total, ctx.cache_ttl_seconds);
-        return frame.total;
-    }
-
-    fn splitDynamicChild(ctx: *DynamicScanContext, frame: *DynamicFrame, child_path: []u8, estimate_files: u64) bool {
-        if (!shouldSplitDynamicChild(ctx, estimate_files)) return false;
-
-        const future = ctx.allocator.create(DynamicScanFuture) catch return false;
-        future.* = .{};
-
-        frame.pending.append(ctx.allocator, future) catch {
-            ctx.allocator.destroy(future);
-            return false;
-        };
-
-        if (enqueueDynamicTask(ctx, child_path, future, estimate_files)) return true;
-
-        _ = frame.pending.pop();
-        ctx.allocator.destroy(future);
-        return false;
-    }
-
-    fn computeDirStatsDynamicOwned(ctx: *DynamicScanContext, root_path: []u8) DirStats {
-        if (zdu.isGeneratedDirPath(root_path)) {
-            ctx.allocator.free(root_path);
-            return .{};
-        }
-
-        var root_dir = std.Io.Dir.cwd().openDir(ctx.io, root_path, .{ .iterate = true }) catch {
-            ctx.allocator.free(root_path);
-            return .{ .dir_count = 1 };
-        };
-
-        if (!ctx.refresh_cache and ctx.cache_ttl_seconds > 0) {
-            if (Cache.readCachedDirStatsFd(root_dir)) |cached_stats| {
-                root_dir.close(ctx.io);
-                ctx.allocator.free(root_path);
-                return cached_stats;
-            }
-        }
-
-        var stack: std.ArrayList(DynamicFrame) = .empty;
-        defer {
-            for (stack.items) |*frame| cleanupDynamicFrame(frame, ctx.allocator, ctx.io);
-            stack.deinit(ctx.allocator);
-        }
-
-        if (!pushDynamicFrame(&stack, ctx.allocator, ctx.io, root_path, root_dir)) return .{};
-
-        while (stack.items.len > 0) {
-            var frame = &stack.items[stack.items.len - 1];
-            if (frame.iter.next(ctx.io) catch null) |entry| {
-                if (entry.kind == .file) {
-                    addStats(&frame.total, fileEntryStats(fileSizeOnDiskAt(frame.dir, entry.name, ctx.io)));
-                    continue;
-                }
-                if (entry.kind != .directory) continue;
-
-                const child_path = std.fs.path.join(ctx.allocator, &.{ frame.path, entry.name }) catch continue;
-                if (zdu.isGeneratedDirPath(child_path)) {
-                    ctx.allocator.free(child_path);
-                    continue;
-                }
-
-                const cached = if (ctx.cache_ttl_seconds > 0) Cache.readCachedDirStats(child_path, ctx.allocator) else null;
-                if (!ctx.refresh_cache) {
-                    if (cached) |cached_stats| {
-                        addStats(&frame.total, cached_stats);
-                        ctx.allocator.free(child_path);
-                        continue;
-                    }
-                }
-
-                const estimate_files = if (cached) |cached_stats| cached_stats.file_count else 0;
-                if (splitDynamicChild(ctx, frame, child_path, estimate_files)) continue;
-
-                const child_dir = frame.dir.openDir(ctx.io, entry.name, .{ .iterate = true }) catch {
-                    ctx.allocator.free(child_path);
-                    continue;
-                };
-                if (!pushDynamicFrame(&stack, ctx.allocator, ctx.io, child_path, child_dir)) continue;
-                continue;
-            }
-
-            var completed = stack.pop().?;
-            const completed_stats = completeDynamicFrame(ctx, &completed);
-            completed.pending.deinit(ctx.allocator);
-            completed.dir.close(ctx.io);
-            ctx.allocator.free(completed.path);
-
-            if (stack.items.len > 0) {
-                addStats(&stack.items[stack.items.len - 1].total, completed_stats);
-            } else {
-                return completed_stats;
-            }
-        }
-
-        return .{};
-    }
-
-    fn runDynamicTask(ctx: *DynamicScanContext, task: DynamicScanTask) void {
-        defer finishDynamicTask(ctx);
-        const stats = computeDirStatsDynamicOwned(ctx, task.path);
-        completeDynamicFuture(ctx.io, task.future, stats);
-    }
-
-    fn dynamicScanWorker(ctx: *DynamicScanContext) void {
-        while (true) {
-            switch (takeDynamicWork(ctx)) {
-                .task => |task| runDynamicTask(ctx, task),
-                .wait => _ = ctx.io.sleep(.fromNanoseconds(dynamic_wait_sleep_ns), .awake) catch {},
-                .done => return,
-            }
-        }
-    }
-
-    fn runDynamicScanWorkers(ctx: *DynamicScanContext, worker_count: usize) !void {
-        const threads = try ctx.allocator.alloc(std.Thread, worker_count);
-        defer ctx.allocator.free(threads);
-
-        var spawned: usize = 0;
-        errdefer {
-            for (threads[0..spawned]) |thread| thread.join();
-        }
-        while (spawned < worker_count) : (spawned += 1) {
-            threads[spawned] = try std.Thread.spawn(.{
-                .stack_size = dynamic_worker_stack_size,
-            }, dynamicScanWorker, .{ctx});
-        }
-        for (threads[0..spawned]) |thread| thread.join();
-    }
-
-    fn computeDynamicScanInputs(io: std.Io, allocator: mem.Allocator, inputs: []const DynamicScanInput, options: Options, worker_count: usize) ![]DirStats {
-        const results = try allocator.alloc(DirStats, inputs.len);
-        errdefer allocator.free(results);
-        for (results) |*result| result.* = .{};
-
-        const futures = try allocator.alloc(DynamicScanFuture, inputs.len);
-        defer allocator.free(futures);
-        for (futures) |*future| future.* = .{};
-
-        var ctx = DynamicScanContext{
-            .io = io,
-            .allocator = allocator,
-            .cache_ttl_seconds = options.cache_ttl_seconds,
-            .refresh_cache = options.refresh_cache,
-            .worker_count = worker_count,
-        };
-        defer deinitDynamicContext(&ctx);
-
-        for (inputs, 0..) |input, i| {
-            const owned_path = try allocator.dupe(u8, input.path);
-            if (!enqueueDynamicTask(&ctx, owned_path, &futures[i], input.estimate_files)) {
-                allocator.free(owned_path);
-                return error.OutOfMemory;
-            }
-        }
-
-        try runDynamicScanWorkers(&ctx, worker_count);
-
-        for (futures, 0..) |*future, i| {
-            results[i] = readDynamicFuture(io, future) orelse .{};
-        }
-        return results;
     }
 
     fn entryScanWorkerCount(parallel: bool, requested: usize, task_count: usize) usize {
@@ -899,9 +526,9 @@ pub const Model = struct {
     fn entryScanWorker(ctx: *EntryScanContext) void {
         while (nextEntryScanTask(ctx)) |idx| {
             ctx.results[idx] = if (ctx.refresh_cache) blk: {
-                break :blk computeDirStatsStackRefreshing(ctx.tasks[idx].path, ctx.allocator, ctx.io, ctx.cache_ttl_seconds) catch .{};
+                break :blk Scan.computeDirStatsStackRefreshing(ctx.tasks[idx].path, ctx.allocator, ctx.io, ctx.cache_ttl_seconds) catch .{};
             } else blk: {
-                break :blk computeDirStatsStack(ctx.tasks[idx].path, ctx.allocator, ctx.io, ctx.cache_ttl_seconds) catch .{};
+                break :blk Scan.computeDirStatsStack(ctx.tasks[idx].path, ctx.allocator, ctx.io, ctx.cache_ttl_seconds) catch .{};
             };
         }
     }
@@ -911,7 +538,7 @@ pub const Model = struct {
 
         const worker_count = entryScanWorkerCount(model.parallel, model.num_threads, tasks.len);
         if (worker_count > 1) {
-            const inputs = try model.allocator.alloc(DynamicScanInput, tasks.len);
+            const inputs = try model.allocator.alloc(Scan.DynamicScanInput, tasks.len);
             defer model.allocator.free(inputs);
             for (tasks, 0..) |task, i| {
                 inputs[i] = .{
@@ -920,7 +547,7 @@ pub const Model = struct {
                 };
             }
 
-            const results = try computeDynamicScanInputs(model.io, model.allocator, inputs, .{
+            const results = try Scan.computeDynamicScanInputs(model.io, model.allocator, inputs, .{
                 .cache_ttl_seconds = model.cache_ttl_seconds,
                 .refresh_cache = model.refresh_cache,
                 .parallel = model.parallel,
@@ -936,9 +563,9 @@ pub const Model = struct {
 
         for (tasks) |task| {
             const stats = if (model.refresh_cache) blk: {
-                break :blk try computeDirStatsStackRefreshing(task.path, model.allocator, model.io, model.cache_ttl_seconds);
+                break :blk try Scan.computeDirStatsStackRefreshing(task.path, model.allocator, model.io, model.cache_ttl_seconds);
             } else blk: {
-                break :blk try computeDirStatsStack(task.path, model.allocator, model.io, model.cache_ttl_seconds);
+                break :blk try Scan.computeDirStatsStack(task.path, model.allocator, model.io, model.cache_ttl_seconds);
             };
             if (task.entry_index < entries.len) updateEntryStats(&entries[task.entry_index], stats);
         }
@@ -1011,7 +638,7 @@ pub const Model = struct {
                     model.allocator,
                     entry.name,
                     null,
-                    fileEntryStats(fileSizeOnDiskAt(dir, entry.name, model.io)),
+                    Scan.fileEntryStats(Scan.fileSizeOnDiskAt(dir, entry.name, model.io)),
                     false,
                     .item,
                 ));
@@ -1122,16 +749,16 @@ pub const Model = struct {
             var frame = &loading.scan_stack.items[loading.scan_stack.items.len - 1];
             if (frame.iter.next(model.io) catch null) |entry| {
                 if (entry.kind == .file) {
-                    const stats = fileEntryStats(fileSizeOnDiskAt(frame.dir, entry.name, model.io));
-                    addStats(&frame.total, stats);
+                    const stats = Scan.fileEntryStats(Scan.fileSizeOnDiskAt(frame.dir, entry.name, model.io));
+                    Scan.addStats(&frame.total, stats);
                     loading.processed_bytes += stats.size;
                     return true;
                 }
 
                 if (entry.kind == .directory) {
-                    switch (openChildDirForScan(frame.dir, model.io, entry.name, model.cache_ttl_seconds, !model.refresh_cache) orelse return true) {
+                    switch (Scan.openChildDirForScan(frame.dir, model.io, entry.name, model.cache_ttl_seconds, !model.refresh_cache) orelse return true) {
                         .cached_stats => |cached_stats| {
-                            addStats(&frame.total, cached_stats);
+                            Scan.addStats(&frame.total, cached_stats);
                             loading.processed_bytes += cached_stats.size;
                             loading.processed_dirs += 1;
                             return true;
@@ -1152,7 +779,7 @@ pub const Model = struct {
             completed.dir.close(model.io);
 
             if (loading.scan_stack.items.len > 0) {
-                addStats(&loading.scan_stack.items[loading.scan_stack.items.len - 1].total, completed.total);
+                Scan.addStats(&loading.scan_stack.items[loading.scan_stack.items.len - 1].total, completed.total);
             } else {
                 try model.finalizeLoadingEntry(completed.entry_index, completed.total, true);
             }
@@ -1170,13 +797,13 @@ pub const Model = struct {
         }
 
         if (!entry.is_dir) {
-            const stats = fileEntryStats(fileSizeOnDiskAt(loading.root_dir, entry.name, model.io));
+            const stats = Scan.fileEntryStats(Scan.fileSizeOnDiskAt(loading.root_dir, entry.name, model.io));
             loading.processed_bytes += stats.size;
             try model.finalizeLoadingEntry(idx, stats, false);
             return true;
         }
 
-        switch (openChildDirForScan(loading.root_dir, model.io, entry.name, model.cache_ttl_seconds, !model.refresh_cache) orelse {
+        switch (Scan.openChildDirForScan(loading.root_dir, model.io, entry.name, model.cache_ttl_seconds, !model.refresh_cache) orelse {
             try model.finalizeLoadingEntry(idx, .{}, false);
             return true;
         }) {
@@ -1301,178 +928,7 @@ pub const Model = struct {
     }
 
     fn computeDirSize(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) u64 {
-        return computeDirStats(path, allocator, io, cache_ttl_seconds).size;
-    }
-
-    const StackFrame = struct {
-        dir: std.Io.Dir,
-        iter: std.Io.Dir.Iterator,
-        total: DirStats = .{ .dir_count = 1 },
-    };
-
-    fn computeDirStats(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) DirStats {
-        return computeDirStatsWithCache(path, allocator, io, cache_ttl_seconds, true);
-    }
-
-    fn computeDirStatsRefreshing(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) DirStats {
-        return computeDirStatsWithCache(path, allocator, io, cache_ttl_seconds, false);
-    }
-
-    fn computeDirStatsWithCache(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64, read_cache: bool) DirStats {
-        if (zdu.isGeneratedDirPath(path)) return .{};
-
-        if (read_cache and cache_ttl_seconds > 0) {
-            if (Cache.readCachedDirStats(path, allocator)) |cached_stats| {
-                return cached_stats;
-            }
-        }
-
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return .{ .dir_count = 1 };
-        defer dir.close(io);
-
-        return computeDirStatsInDir(dir, io, cache_ttl_seconds, read_cache);
-    }
-
-    fn computeDirStatsInDir(dir: std.Io.Dir, io: std.Io, cache_ttl_seconds: u64, read_cache: bool) DirStats {
-        if (read_cache and cache_ttl_seconds > 0) {
-            if (Cache.readCachedDirStatsFd(dir)) |cached_stats| {
-                return cached_stats;
-            }
-        }
-
-        var total: DirStats = .{ .dir_count = 1 };
-        var iter = dir.iterateAssumeFirstIteration();
-        while (iter.next(io) catch null) |entry| {
-            if (entry.kind == .file) {
-                addStats(&total, fileEntryStats(fileSizeOnDiskAt(dir, entry.name, io)));
-            } else if (entry.kind == .directory) {
-                switch (openChildDirForScan(dir, io, entry.name, cache_ttl_seconds, read_cache) orelse continue) {
-                    .cached_stats => |cached_stats| addStats(&total, cached_stats),
-                    .dir => |subdir| {
-                        defer subdir.close(io);
-                        addStats(&total, computeDirStatsInDir(subdir, io, cache_ttl_seconds, read_cache));
-                    },
-                }
-            }
-        }
-        Cache.writeCachedDirStatsFd(dir, total, cache_ttl_seconds);
-        return total;
-    }
-
-    fn computeDirStatsStack(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) !DirStats {
-        return computeDirStatsStackWithCache(path, allocator, io, cache_ttl_seconds, true);
-    }
-
-    fn computeDirStatsStackRefreshing(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64) !DirStats {
-        return computeDirStatsStackWithCache(path, allocator, io, cache_ttl_seconds, false);
-    }
-
-    fn computeDirStatsStackWithCache(path: []const u8, allocator: mem.Allocator, io: std.Io, cache_ttl_seconds: u64, read_cache: bool) !DirStats {
-        var stack: std.ArrayList(StackFrame) = .empty;
-        defer {
-            for (stack.items) |*frame| {
-                frame.dir.close(io);
-            }
-            stack.deinit(allocator);
-        }
-
-        var root_dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return .{ .dir_count = 1 };
-        if (read_cache and cache_ttl_seconds > 0) {
-            if (Cache.readCachedDirStatsFd(root_dir)) |cached_stats| {
-                root_dir.close(io);
-                return cached_stats;
-            }
-        }
-        try pushDirStatsFrame(&stack, allocator, io, root_dir);
-
-        while (stack.items.len > 0) {
-            var frame = &stack.items[stack.items.len - 1];
-            if (frame.iter.next(io) catch null) |entry| {
-                if (entry.kind == .file) {
-                    addStats(&frame.total, fileEntryStats(fileSizeOnDiskAt(frame.dir, entry.name, io)));
-                    continue;
-                }
-                if (entry.kind == .directory) {
-                    switch (openChildDirForScan(frame.dir, io, entry.name, cache_ttl_seconds, read_cache) orelse continue) {
-                        .cached_stats => |cached_stats| {
-                            addStats(&frame.total, cached_stats);
-                            continue;
-                        },
-                        .dir => |subdir| {
-                            try pushDirStatsFrame(&stack, allocator, io, subdir);
-                            continue;
-                        },
-                    }
-                }
-                continue;
-            }
-
-            const completed = stack.pop().?;
-            Cache.writeCachedDirStatsFd(completed.dir, completed.total, cache_ttl_seconds);
-            completed.dir.close(io);
-
-            if (stack.items.len > 0) {
-                addStats(&stack.items[stack.items.len - 1].total, completed.total);
-            } else {
-                return completed.total;
-            }
-        }
-
-        return .{};
-    }
-
-    fn fileSizeOnDisk(path: []const u8, allocator: mem.Allocator, io: std.Io) u64 {
-        _ = allocator;
-        return fileSizeOnDiskAt(std.Io.Dir.cwd(), path, io);
-    }
-
-    fn fileSizeOnDiskAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
-        return switch (builtin.os.tag) {
-            .linux => if (builtin.link_libc) fileSizeOnDiskWithLibcAt(dir, sub_path, io) else fileSizeOnDiskFallbackAt(dir, sub_path, io),
-            .macos => if (builtin.cpu.arch == .x86_64)
-                fileSizeOnDiskFallbackAt(dir, sub_path, io)
-            else if (builtin.link_libc)
-                fileSizeOnDiskWithLibcAt(dir, sub_path, io)
-            else
-                fileSizeOnDiskFallbackAt(dir, sub_path, io),
-            else => fileSizeOnDiskFallbackAt(dir, sub_path, io),
-        };
-    }
-
-    fn cStatAt(dir: std.Io.Dir, sub_path: []const u8) ?PosixStat {
-        if (comptime !have_posix_stat) return null;
-
-        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        if (sub_path.len + 1 > path_buf.len) return null;
-        @memcpy(path_buf[0..sub_path.len], sub_path);
-        path_buf[sub_path.len] = 0;
-        var stat: PosixStat = undefined;
-        if (c_stat.fstatat(dir.handle, @ptrCast(path_buf[0..sub_path.len :0].ptr), &stat, std.c.AT.SYMLINK_NOFOLLOW) != 0) {
-            return null;
-        }
-        return stat;
-    }
-
-    fn fileSizeOnDiskWithLibcAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
-        if (comptime !have_posix_stat) return fileSizeOnDiskFallbackAt(dir, sub_path, io);
-
-        const stat = cStatAt(dir, sub_path) orelse return fileSizeOnDiskFallbackAt(dir, sub_path, io);
-        return posixStatAllocatedSize(stat);
-    }
-
-    fn fileSizeOnDiskFallbackAt(dir: std.Io.Dir, sub_path: []const u8, io: std.Io) u64 {
-        const stat = dir.statFile(io, sub_path, .{ .follow_symlinks = false }) catch return 0;
-        return stat.size;
-    }
-
-    fn readCachedDirSize(path: []const u8, allocator: mem.Allocator) ?u64 {
-        if (Cache.readCachedDirStats(path, allocator)) |stats| return stats.size;
-        return null;
-    }
-
-    fn readCachedDirSizeFd(dir: std.Io.Dir) ?u64 {
-        if (Cache.readCachedDirStatsFd(dir)) |stats| return stats.size;
-        return null;
+        return Scan.computeDirStats(path, allocator, io, cache_ttl_seconds).size;
     }
 
     fn knownDirStats(model: *Model) ?DirStats {
@@ -1514,7 +970,7 @@ pub const Model = struct {
         for (model.entries) |*entry| {
             if (entry.role != .item) continue;
             if (!entryPathMatches(model, entry.*, target_path)) continue;
-            if (subtractStats(statsFromEntry(entry.*), deleted_stats)) |updated_stats| {
+            if (Scan.subtractStats(statsFromEntry(entry.*), deleted_stats)) |updated_stats| {
                 updateEntryStats(entry, updated_stats);
             }
             return;
@@ -1531,7 +987,7 @@ pub const Model = struct {
             if (child != null) subtractEntryStatsByPath(cursor, changed_path, deleted_stats);
 
             if (maybe_current_stats) |current_stats| {
-                if (subtractStats(current_stats, deleted_stats)) |updated_stats| {
+                if (Scan.subtractStats(current_stats, deleted_stats)) |updated_stats| {
                     updateSummaryEntryStats(cursor, updated_stats);
                     Cache.writeCachedDirStats(cursor.cwd, updated_stats, cursor.cache_ttl_seconds, cursor.allocator);
                     if (child) |child_model| child_model.updateParentEntryStats(updated_stats);
@@ -2245,7 +1701,7 @@ test "directory size xattr round trip" {
     defer std.testing.allocator.free(dir_path);
 
     Cache.writeCachedDirSize(dir_path, 1234, 60, std.testing.allocator);
-    const cached = Model.readCachedDirSize(dir_path, std.testing.allocator);
+    const cached = Scan.readCachedDirSize(dir_path, std.testing.allocator);
 
     if (cached == null) return error.SkipZigTest;
     try std.testing.expectEqual(@as(?u64, 1234), cached);
@@ -2537,7 +1993,7 @@ test "delete walks parent chain and updates cached stats without a rescan" {
     try model.deleteSelected();
     try model.confirmDelete();
 
-    const remaining_size = Model.fileSizeOnDisk(root_file_path, std.testing.allocator, std.testing.io);
+    const remaining_size = Scan.fileSizeOnDisk(root_file_path, std.testing.allocator, std.testing.io);
     const child_stats = try zduTestRequireCachedStats(child_path, std.testing.allocator);
     const root_stats = try zduTestRequireCachedStats(root_path, std.testing.allocator);
 
@@ -2721,176 +2177,16 @@ fn parseBoolArg(value: []const u8) ?bool {
     return null;
 }
 
-const RootScanMode = enum {
-    worker,
-    stack,
-};
-
-const RootScanOptions = struct {
-    cache_ttl_seconds: u64 = 0,
-    refresh_cache: bool = false,
-    parallel: bool = false,
-    num_threads: usize = 0,
-};
-
-const ParallelScanTask = struct {
-    path: []u8,
-    estimate_files: u64,
-};
-
-const ParallelScanContext = struct {
-    io: std.Io,
-    allocator: mem.Allocator,
-    cache_ttl_seconds: u64,
-    refresh_cache: bool,
-    tasks: []const ParallelScanTask,
-    results: []Model.DirStats,
-    next_index: usize = 0,
-    mutex: std.Io.Mutex = .init,
-};
-
-fn sortParallelTasks(tasks: []ParallelScanTask) void {
-    mem.sortUnstable(ParallelScanTask, tasks, {}, struct {
-        fn less(_: void, a: ParallelScanTask, b: ParallelScanTask) bool {
-            if (a.estimate_files != b.estimate_files) return a.estimate_files > b.estimate_files;
-            return mem.lessThan(u8, a.path, b.path);
-        }
-    }.less);
-}
-
-fn computeRootTaskStats(io: std.Io, allocator: mem.Allocator, path: []const u8, cache_ttl_seconds: u64, refresh_cache: bool, mode: RootScanMode) !Model.DirStats {
-    return switch (mode) {
-        .worker => if (refresh_cache)
-            Model.computeDirStatsRefreshing(path, allocator, io, cache_ttl_seconds)
-        else
-            Model.computeDirStats(path, allocator, io, cache_ttl_seconds),
-        .stack => if (refresh_cache)
-            try Model.computeDirStatsStackRefreshing(path, allocator, io, cache_ttl_seconds)
-        else
-            try Model.computeDirStatsStack(path, allocator, io, cache_ttl_seconds),
-    };
-}
-
-fn nextParallelTask(ctx: *ParallelScanContext) ?usize {
-    ctx.mutex.lockUncancelable(ctx.io);
-    defer ctx.mutex.unlock(ctx.io);
-
-    if (ctx.next_index >= ctx.tasks.len) return null;
-    const idx = ctx.next_index;
-    ctx.next_index += 1;
-    return idx;
-}
-
-fn parallelScanWorker(ctx: *ParallelScanContext) void {
-    while (nextParallelTask(ctx)) |idx| {
-        ctx.results[idx] = computeRootTaskStats(
-            ctx.io,
-            ctx.allocator,
-            ctx.tasks[idx].path,
-            ctx.cache_ttl_seconds,
-            ctx.refresh_cache,
-            .stack,
-        ) catch .{};
-    }
-}
-
-fn resolvedWorkerCount(parallel: bool, requested: usize, task_count: usize) usize {
-    if (!parallel or task_count == 0) return 1;
-    const detected = if (requested == 0) std.Thread.getCpuCount() catch 1 else requested;
-    return @max(@as(usize, 1), detected);
-}
-
-fn scanRootStatsMode(io: std.Io, allocator: mem.Allocator, cwd: []const u8, opts: RootScanOptions, mode: RootScanMode) !Model.DirStats {
-    if (zdu.isGeneratedDirPath(cwd)) return .{};
-
-    var dir = std.Io.Dir.cwd().openDir(io, cwd, .{ .iterate = true }) catch return .{ .dir_count = 1 };
-    defer dir.close(io);
-
-    var tasks: std.ArrayList(ParallelScanTask) = .empty;
-    defer {
-        for (tasks.items) |task| allocator.free(task.path);
-        tasks.deinit(allocator);
-    }
-
-    var root_stats: Model.DirStats = .{ .dir_count = 1 };
-    var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
-        if (entry.kind == .directory) {
-            const full_path = try std.fs.path.join(allocator, &.{ cwd, entry.name });
-            errdefer allocator.free(full_path);
-            if (zdu.isGeneratedDirPath(full_path)) {
-                allocator.free(full_path);
-                continue;
-            }
-            const estimate_files = if (Cache.readCachedDirStats(full_path, allocator)) |cached_stats| cached_stats.file_count else 0;
-            try tasks.append(allocator, .{
-                .path = full_path,
-                .estimate_files = estimate_files,
-            });
-        } else if (entry.kind == .file) {
-            Model.addStats(&root_stats, Model.fileEntryStats(Model.fileSizeOnDiskAt(dir, entry.name, io)));
-        }
-    }
-
-    sortParallelTasks(tasks.items);
-
-    const worker_count = resolvedWorkerCount(opts.parallel and mode == .stack, opts.num_threads, tasks.items.len);
-    if (worker_count > 1) {
-        const inputs = try allocator.alloc(Model.DynamicScanInput, tasks.items.len);
-        defer allocator.free(inputs);
-        for (tasks.items, 0..) |task, i| {
-            inputs[i] = .{
-                .path = task.path,
-                .estimate_files = task.estimate_files,
-            };
-        }
-
-        const results = try Model.computeDynamicScanInputs(io, allocator, inputs, .{
-            .cache_ttl_seconds = opts.cache_ttl_seconds,
-            .refresh_cache = opts.refresh_cache,
-            .parallel = opts.parallel,
-            .num_threads = opts.num_threads,
-        }, worker_count);
-        defer allocator.free(results);
-
-        for (results) |stats| Model.addStats(&root_stats, stats);
-    } else {
-        for (tasks.items) |task| {
-            const stats = try computeRootTaskStats(
-                io,
-                allocator,
-                task.path,
-                opts.cache_ttl_seconds,
-                opts.refresh_cache,
-                mode,
-            );
-            Model.addStats(&root_stats, stats);
-        }
-    }
-
-    Cache.writeCachedDirStats(cwd, root_stats, opts.cache_ttl_seconds, allocator);
-    return root_stats;
-}
-
-fn scanRootStats(io: std.Io, allocator: mem.Allocator, cwd: []const u8, opts: RootScanOptions) !Model.DirStats {
-    return scanRootStatsMode(io, allocator, cwd, opts, .stack);
-}
-
-fn scanRootTotal(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64, mode: RootScanMode) !u64 {
-    const stats = try scanRootStatsMode(io, allocator, cwd, .{ .cache_ttl_seconds = cache_ttl_seconds }, mode);
-    return stats.size;
-}
-
 fn benchmarkWorkerLoad(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !u64 {
     const start = std.Io.Timestamp.now(io, .awake);
-    _ = try scanRootTotal(io, allocator, cwd, cache_ttl_seconds, .worker);
+    _ = try Scan.scanRootTotal(io, allocator, cwd, cache_ttl_seconds, .worker);
     const end = std.Io.Timestamp.now(io, .awake);
     return @as(u64, @intCast(@divFloor(start.durationTo(end).nanoseconds, std.time.ns_per_ms)));
 }
 
 fn benchmarkStackLoad(io: std.Io, allocator: mem.Allocator, cwd: []const u8, cache_ttl_seconds: u64) !u64 {
     const start = std.Io.Timestamp.now(io, .awake);
-    _ = try scanRootTotal(io, allocator, cwd, cache_ttl_seconds, .stack);
+    _ = try Scan.scanRootTotal(io, allocator, cwd, cache_ttl_seconds, .stack);
 
     const end = std.Io.Timestamp.now(io, .awake);
     return @as(u64, @intCast(@divFloor(start.durationTo(end).nanoseconds, std.time.ns_per_ms)));
@@ -2926,7 +2222,7 @@ fn runNoTui(io: std.Io, allocator: mem.Allocator, config: Config) !void {
     }
 
     const stats: Model.DirStats = if (use_cache_path)
-        try scanRootStats(io, allocator, config.cwd, .{
+        try Scan.scanRootStats(io, allocator, config.cwd, .{
             .cache_ttl_seconds = config.cache_ttl_seconds,
             .refresh_cache = config.refresh_cache,
             .parallel = config.parallel,
@@ -3277,13 +2573,13 @@ test "parseArgs: --summarize" {
 }
 
 test "parallel scan tasks are sorted by cached file count" {
-    var tasks = [_]ParallelScanTask{
+    var tasks = [_]Scan.ParallelScanTask{
         .{ .path = @constCast("small"), .estimate_files = 1 },
         .{ .path = @constCast("large"), .estimate_files = 10 },
         .{ .path = @constCast("middle"), .estimate_files = 5 },
     };
 
-    sortParallelTasks(tasks[0..]);
+    Scan.sortParallelTasks(tasks[0..]);
 
     try std.testing.expectEqualStrings("large", tasks[0].path);
     try std.testing.expectEqualStrings("middle", tasks[1].path);
@@ -3321,7 +2617,7 @@ fn zduTestWriteFile(
 }
 
 fn zduTestRequireCachedSize(path: []const u8, allocator: mem.Allocator) !u64 {
-    return Model.readCachedDirSize(path, allocator) orelse error.TestUnexpectedResult;
+    return Scan.readCachedDirSize(path, allocator) orelse error.TestUnexpectedResult;
 }
 
 fn zduTestRequireCachedStats(path: []const u8, allocator: mem.Allocator) !Model.DirStats {
@@ -3503,7 +2799,7 @@ test "scanRootStats refreshes v3 stats cache with file counts" {
     Cache.clearCachedDirSize(root_path, allocator);
     Cache.clearCachedDirSize(a_path, allocator);
 
-    const stats = try scanRootStats(std.testing.io, allocator, root_path, .{
+    const stats = try Scan.scanRootStats(std.testing.io, allocator, root_path, .{
         .cache_ttl_seconds = 1800,
         .refresh_cache = true,
     });
@@ -3616,7 +2912,7 @@ test "expired dir size cache is recomputed and refreshed" {
 
     try zduTestSetRawDirSizeXattr(dir_path, expired_record[0..], allocator);
 
-    const stats = Model.computeDirStats(
+    const stats = Scan.computeDirStats(
         dir_path,
         allocator,
         std.testing.io,
@@ -3650,7 +2946,7 @@ test "refresh cache ignores a still-fresh stats record" {
     const stale: Model.DirStats = .{ .size = 999_999, .file_count = 99, .dir_count = 99 };
     Cache.writeCachedDirStats(dir_path, stale, 1800, allocator);
 
-    const refreshed = Model.computeDirStatsRefreshing(dir_path, allocator, std.testing.io, 1800);
+    const refreshed = Scan.computeDirStatsRefreshing(dir_path, allocator, std.testing.io, 1800);
     try std.testing.expect(refreshed.size != stale.size);
     try std.testing.expectEqual(@as(u64, 1), refreshed.file_count);
     try std.testing.expectEqual(@as(u64, 1), refreshed.dir_count);
@@ -3682,14 +2978,14 @@ test "parallel root scan matches serial stack scan" {
     const root_path = try zduTestTmpPath(allocator, &tmp, "root");
     defer allocator.free(root_path);
 
-    const serial = try scanRootStats(std.testing.io, allocator, root_path, .{
+    const serial = try Scan.scanRootStats(std.testing.io, allocator, root_path, .{
         .cache_ttl_seconds = 1800,
         .refresh_cache = true,
         .parallel = false,
         .num_threads = 1,
     });
 
-    const parallel = try scanRootStats(std.testing.io, allocator, root_path, .{
+    const parallel = try Scan.scanRootStats(std.testing.io, allocator, root_path, .{
         .cache_ttl_seconds = 1800,
         .refresh_cache = true,
         .parallel = true,
@@ -3730,11 +3026,11 @@ test "dynamic parallel scan splits nested children and waits before parent cache
     Cache.writeCachedDirStats(a_path, .{ .size = 999_999, .file_count = Model.dynamic_split_min_files, .dir_count = 1 }, 1800, allocator);
     Cache.writeCachedDirStats(b_path, .{ .size = 888_888, .file_count = Model.dynamic_split_min_files, .dir_count = 1 }, 1800, allocator);
 
-    const inputs = [_]Model.DynamicScanInput{
+    const inputs = [_]Scan.DynamicScanInput{
         .{ .path = huge_path, .estimate_files = Model.dynamic_split_min_files * 2 },
     };
 
-    const results = try Model.computeDynamicScanInputs(std.testing.io, allocator, inputs[0..], .{
+    const results = try Scan.computeDynamicScanInputs(std.testing.io, allocator, inputs[0..], .{
         .cache_ttl_seconds = 1800,
         .refresh_cache = true,
         .parallel = true,
@@ -3760,9 +3056,9 @@ test "dynamic parallel scan splits nested children and waits before parent cache
 }
 
 test "parallel worker count can exceed initial task count for dynamic splitting" {
-    try std.testing.expectEqual(@as(usize, 4), resolvedWorkerCount(true, 4, 1));
+    try std.testing.expectEqual(@as(usize, 4), Scan.resolvedWorkerCount(true, 4, 1));
     try std.testing.expectEqual(@as(usize, 3), Model.entryScanWorkerCount(true, 3, 1));
-    try std.testing.expectEqual(@as(usize, 1), resolvedWorkerCount(true, 4, 0));
+    try std.testing.expectEqual(@as(usize, 1), Scan.resolvedWorkerCount(true, 4, 0));
     try std.testing.expectEqual(@as(usize, 1), Model.entryScanWorkerCount(false, 3, 8));
 }
 

@@ -22,14 +22,14 @@
   - [x] Move `currentTimestampSeconds`, `cacheExpiresAt`
   - [x] `main.zig` imports `Cache.zig` and uses `Cache.*` for all cache operations
 
-- [ ] **2.2 Extract Scan module from Model**
-  - [ ] Create `src/Scan.zig`
-  - [ ] Move stack-based scanning: `computeDirStatsStack`, `computeDirStatsStackWithCache`
-  - [ ] Move recursive scanning: `computeDirStats`, `computeDirStatsInDir`
-  - [ ] Move dynamic parallel scanning: `computeDirStatsDynamicOwned`, `DynamicScanContext`, etc.
-  - [ ] Move root parallel scanning: `scanRootStats`, `scanRootStatsMode`, `ParallelScanContext`
-  - [ ] Move `fileSizeOnDiskAt`, `cStatAt`, `posixStat*` helpers
-  - [ ] Keep `Model` focused on TUI state and event handling
+- [x] **2.2 Extract Scan module from Model**
+  - [x] Create `src/Scan.zig`
+  - [x] Move stack-based scanning: `computeDirStatsStack`, `computeDirStatsStackWithCache`
+  - [x] Move recursive scanning: `computeDirStats`, `computeDirStatsInDir`
+  - [x] Move dynamic parallel scanning: `computeDirStatsDynamicOwned`, `DynamicScanContext`, etc.
+  - [x] Move root parallel scanning: `scanRootStats`, `scanRootStatsMode`, `ParallelScanContext`
+  - [x] Move `fileSizeOnDiskAt`, `cStatAt`, `posixStat*` helpers
+  - [x] Keep `Model` focused on TUI state and event handling
 
 - [ ] **2.3 Deduplicate library and CLI scanning code**
   - [ ] Audit `lib/zdu.zig` vs `src/main.zig` for duplicated helpers
