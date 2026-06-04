@@ -3206,10 +3206,15 @@ test "integration: --no-tui --summarize prints summary" {
     try tmp.dir.createDirPath(std.testing.io, "a/b");
     var f1 = try tmp.dir.createFile(std.testing.io, "a/file1.txt", .{});
     defer f1.close(std.testing.io);
-    try f1.writeStreamingAll(std.testing.io, "hello");
+    // Write enough data to exceed 1K total so human format shows a unit suffix
+    var buf1: [600]u8 = undefined;
+    @memset(&buf1, 'x');
+    try f1.writeStreamingAll(std.testing.io, &buf1);
     var f2 = try tmp.dir.createFile(std.testing.io, "a/b/file2.txt", .{});
     defer f2.close(std.testing.io);
-    try f2.writeStreamingAll(std.testing.io, "world");
+    var buf2: [600]u8 = undefined;
+    @memset(&buf2, 'y');
+    try f2.writeStreamingAll(std.testing.io, &buf2);
 
     const path = try std.fs.path.join(allocator, &.{
         ".zig-cache",
