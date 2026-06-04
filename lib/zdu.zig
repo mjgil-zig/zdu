@@ -642,11 +642,13 @@ fn scanParallel(
                 thread_alloc: mem.Allocator,
                 thread_opts: Options,
                 thread_dir: std.Io.Dir,
-                items: []const SubDir,
+                all_subdirs: []const SubDir,
+                start: usize,
+                end: usize,
                 check_gen: bool,
                 result: *ThreadResult,
             ) void {
-                for (items) |sd| {
+                for (all_subdirs[start..end]) |sd| {
                     var subdir = thread_dir.openDir(thread_io, sd.name, .{
                         .iterate = true,
                         .follow_symlinks = false,
@@ -658,7 +660,7 @@ fn scanParallel(
                     };
                 }
             }
-        }.run, .{ io, allocator, opts, dir, subdirs.items[start_idx..end_idx], check_generated_paths, &thread_results[i] });
+        }.run, .{ io, allocator, opts, dir, subdirs.items, start_idx, end_idx, check_generated_paths, &thread_results[i] });
 
         start_idx = end_idx;
     }
