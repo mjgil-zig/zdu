@@ -77,6 +77,20 @@ pub fn scanAndFormat(io: std.Io, allocator: mem.Allocator, opts: Options, writer
         return;
     }
 
+    // Use parallel scan for summarize mode; streaming output requires serial walk
+    if (opts.parallel and opts.summarize) {
+        const result = try scan(io, allocator, opts);
+        switch (opts.format) {
+            .human => try writeHumanSummary(writer, result),
+            .json => {
+                try writer.writeAll("{\n  \"entries\": [\n  ],\n");
+                try writeJsonSummaryFields(writer, result);
+                try writer.writeAll("}\n");
+            },
+        }
+        return;
+    }
+
     var totals: ScanTotals = .{};
     var first_json_entry = true;
 
@@ -146,9 +160,13 @@ pub fn scan(io: std.Io, allocator: mem.Allocator, opts: Options) !ScanResult {
     var dir = try std.Io.Dir.cwd().openDir(io, opts.path, .{ .iterate = true });
     defer dir.close(io);
 
-    var iter = dir.iterate();
-    const check_generated_paths = pathNeedsGeneratedDirChecks(opts.path);
-    try walkDirTotals(allocator, io, opts, if (check_generated_paths) opts.path else null, check_generated_paths, dir, &iter, 0, &totals);
+    if (opts.parallel and opts.num_threads != 1) {
+        try scanParallel(allocator, io, opts, opts.path, dir, &totals);
+    } else {
+        var iter = dir.iterate();
+        const check_generated_paths = pathNeedsGeneratedDirChecks(opts.path);
+        try walkDirTotals(allocator, io, opts, if (check_generated_paths) opts.path else null, check_generated_paths, dir, &iter, 0, &totals);
+    }
 
     const end = std.Io.Timestamp.now(io, .awake);
     return .{
@@ -533,4 +551,176 @@ test "scan skips /proc entirely" {
     try std.testing.expectEqual(@as(u64, 0), result.total_files);
     try std.testing.expectEqual(@as(u64, 0), result.total_dirs);
     try std.testing.expectEqual(@as(u64, 0), result.error_count);
+}
+
+fn scanParallel(
+    allocator: mem.Allocator,
+    io: std.Io,
+    opts: Options,
+    root_path: []const u8,
+    dir: std.Io.Dir,
+    totals: *ScanTotals,
+) !void {
+    const SubDir = struct {
+        name: []const u8,
+        full_path: []const u8,
+    };
+
+    var subdirs: std.ArrayList(SubDir) = .empty;
+    defer {
+        for (subdirs.items) |sd| allocator.free(sd.full_path);
+        subdirs.deinit(allocator);
+    }
+
+    var iter = dir.iterate();
+    const check_generated_paths = pathNeedsGeneratedDirChecks(root_path);
+    while (iter.next(io) catch null) |entry| {
+        const kind = entryKindAndSize(io, dir, entry.name, entry.kind, &totals.error_count) catch continue;
+        if (kind.is_file) {
+            recordEntry(kind.size, false, true, totals);
+            totals.entry_count += 1;
+        } else if (kind.is_dir) {
+            recordEntry(0, true, false, totals);
+            totals.entry_count += 1;
+            const full_path = if (check_generated_paths)
+                try fs.path.join(allocator, &.{ root_path, entry.name })
+            else
+                try allocator.dupe(u8, entry.name);
+            if (isGeneratedDirPath(full_path)) {
+                allocator.free(full_path);
+                continue;
+            }
+            try subdirs.append(allocator, .{ .name = entry.name, .full_path = full_path });
+        }
+    }
+
+    if (subdirs.items.len == 0) return;
+
+    const worker_count = if (opts.num_threads == 0)
+        std.Thread.getCpuCount() catch 1
+    else
+        opts.num_threads;
+    const actual_workers = @min(worker_count, subdirs.items.len);
+    if (actual_workers <= 1) {
+        for (subdirs.items) |sd| {
+            var subdir = dir.openDir(io, sd.name, .{
+                .iterate = true,
+                .follow_symlinks = false,
+            }) catch continue;
+            defer subdir.close(io);
+            var subiter = subdir.iterate();
+            try walkDirTotals(allocator, io, opts, sd.full_path, check_generated_paths, subdir, &subiter, 1, totals);
+        }
+        return;
+    }
+
+    const ThreadResult = struct {
+        totals: ScanTotals = .{},
+    };
+
+    const per_thread = subdirs.items.len / actual_workers;
+    const remainder = subdirs.items.len % actual_workers;
+
+    var thread_results = try allocator.alloc(ThreadResult, actual_workers);
+    defer allocator.free(thread_results);
+    for (thread_results) |*tr| tr.* = .{};
+
+    var threads = try allocator.alloc(std.Thread, actual_workers);
+    defer allocator.free(threads);
+
+    var start_idx: usize = 0;
+    for (0..actual_workers) |i| {
+        const count = per_thread + if (i < remainder) @as(usize, 1) else 0;
+        const end_idx = start_idx + count;
+
+        threads[i] = try std.Thread.spawn(.{}, struct {
+            fn run(
+                thread_io: std.Io,
+                thread_alloc: mem.Allocator,
+                thread_opts: Options,
+                thread_dir: std.Io.Dir,
+                items: []const SubDir,
+                check_gen: bool,
+                result: *ThreadResult,
+            ) void {
+                for (items) |sd| {
+                    var subdir = thread_dir.openDir(thread_io, sd.name, .{
+                        .iterate = true,
+                        .follow_symlinks = false,
+                    }) catch continue;
+                    defer subdir.close(thread_io);
+                    var subiter = subdir.iterate();
+                    walkDirTotals(thread_alloc, thread_io, thread_opts, sd.full_path, check_gen, subdir, &subiter, 1, &result.totals) catch {
+                        result.totals.error_count += 1;
+                    };
+                }
+            }
+        }.run, .{ io, allocator, opts, dir, subdirs.items[start_idx..end_idx], check_generated_paths, &thread_results[i] });
+
+        start_idx = end_idx;
+    }
+
+    for (threads) |thread| thread.join();
+
+    for (thread_results) |tr| {
+        totals.total_size += tr.totals.total_size;
+        totals.total_files += tr.totals.total_files;
+        totals.total_dirs += tr.totals.total_dirs;
+        totals.error_count += tr.totals.error_count;
+        totals.entry_count += tr.totals.entry_count;
+    }
+}
+
+test "scan parallel produces same results as serial" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create a small directory tree
+    {
+        try tmp.dir.createDirPath(std.testing.io, "a/b");
+        var f1 = try tmp.dir.createFile(std.testing.io, "a/file1.txt", .{});
+        defer f1.close(std.testing.io);
+        try f1.writeStreamingAll(std.testing.io, "hello");
+        var f2 = try tmp.dir.createFile(std.testing.io, "a/b/file2.txt", .{});
+        defer f2.close(std.testing.io);
+        try f2.writeStreamingAll(std.testing.io, "world");
+        try tmp.dir.createDirPath(std.testing.io, "c");
+        var f3 = try tmp.dir.createFile(std.testing.io, "c/file3.txt", .{});
+        defer f3.close(std.testing.io);
+        try f3.writeStreamingAll(std.testing.io, "!!!");
+    }
+
+    const path = try fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer std.testing.allocator.free(path);
+
+    const serial = try scan(std.testing.io, std.testing.allocator, .{
+        .path = path,
+        .format = .human,
+        .summarize = true,
+        .show_hidden = true,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = false,
+        .num_threads = 1,
+    });
+
+    const parallel = try scan(std.testing.io, std.testing.allocator, .{
+        .path = path,
+        .format = .human,
+        .summarize = true,
+        .show_hidden = true,
+        .max_depth = null,
+        .max_entries = null,
+        .parallel = true,
+        .num_threads = 4,
+    });
+
+    try std.testing.expectEqual(serial.total_size, parallel.total_size);
+    try std.testing.expectEqual(serial.total_files, parallel.total_files);
+    try std.testing.expectEqual(serial.total_dirs, parallel.total_dirs);
+    try std.testing.expectEqual(serial.error_count, parallel.error_count);
 }

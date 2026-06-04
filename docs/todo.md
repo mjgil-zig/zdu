@@ -98,10 +98,11 @@
   - [x] Replaced `std.heap.page_allocator` with passed allocator
   - [x] Updated all callers and tests
 
-- [ ] **5.3 Implement `parallel` and `num_threads` in library**
-  - [ ] Have `zdu.scan()` respect `opts.parallel` and `opts.num_threads`
-  - [ ] Reuse `Scan.zig` dynamic parallel scheduler
-  - [ ] Ensure `scanAndFormat` can also use parallel mode
+- [x] **5.3 Implement `parallel` and `num_threads` in library**
+  - [x] Have `zdu.scan()` respect `opts.parallel` and `opts.num_threads`
+  - [x] Implemented `scanParallel` in `lib/zdu.zig` with top-level directory splitting across threads
+  - [x] `scanAndFormat` uses parallel `scan()` when `opts.parallel` and `opts.summarize` are both true
+  - [x] Added test verifying parallel and serial scans produce identical results
 
 ## Phase 6: Testing & Quality
 
