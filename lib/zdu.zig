@@ -4,32 +4,32 @@ const mem = std.mem;
 
 const builtin = @import("builtin");
 
-const have_posix_stat = builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos);
-const PosixStat = if (have_posix_stat) std.c.Stat else struct {
+pub const have_posix_stat = builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos);
+pub const PosixStat = if (have_posix_stat) std.c.Stat else struct {
     size: i64 = 0,
     mode: u32 = 0,
     blocks: i64 = 0,
 };
 
-const c_stat = if (have_posix_stat) struct {
+pub const c_stat = if (have_posix_stat) struct {
     extern "c" fn fstatat(dirfd: std.c.fd_t, path: [*:0]const u8, buf: *std.c.Stat, flag: u32) c_int;
 } else struct {};
 
-fn posixStatIsRegular(stat: PosixStat) bool {
+pub fn posixStatIsRegular(stat: PosixStat) bool {
     if (comptime !have_posix_stat) return false;
     return std.c.S.ISREG(stat.mode);
 }
 
-fn posixStatIsDirectory(stat: PosixStat) bool {
+pub fn posixStatIsDirectory(stat: PosixStat) bool {
     if (comptime !have_posix_stat) return false;
     return std.c.S.ISDIR(stat.mode);
 }
 
-fn posixStatApparentSize(stat: PosixStat) u64 {
+pub fn posixStatApparentSize(stat: PosixStat) u64 {
     return if (stat.size < 0) 0 else @intCast(stat.size);
 }
 
-fn posixStatAllocatedSize(stat: PosixStat) u64 {
+pub fn posixStatAllocatedSize(stat: PosixStat) u64 {
     const apparent_size = posixStatApparentSize(stat);
     if (!posixStatIsRegular(stat)) return apparent_size;
     if (stat.blocks <= 0) return apparent_size;

@@ -31,11 +31,12 @@
   - [x] Move `fileSizeOnDiskAt`, `cStatAt`, `posixStat*` helpers
   - [x] Keep `Model` focused on TUI state and event handling
 
-- [ ] **2.3 Deduplicate library and CLI scanning code**
-  - [ ] Audit `lib/zdu.zig` vs `src/main.zig` for duplicated helpers
-  - [ ] Move shared `fileSizeOnDiskAt`, `cStatAt`, `posixStat*` into `lib/zdu.zig`
-  - [ ] Have `src/main.zig` import these from `lib/zdu.zig` instead of redefining
-  - [ ] Ensure `lib/zdu.zig` stays testable and doesn't depend on TUI code
+- [x] **2.3 Deduplicate library and CLI scanning code**
+  - [x] Audit `lib/zdu.zig` vs `src/Scan.zig` for duplicated helpers
+  - [x] `lib/zdu.zig` is the source of truth for `have_posix_stat`, `PosixStat`, `c_stat`, `posixStat*`, `cStatAt`, `fileSizeOnDisk*`, `isGeneratedDirPath`
+  - [x] `src/Scan.zig` imports these from `zdu` module instead of redefining
+  - [x] `src/main.zig` accesses them via `Scan.*` which delegates to `zdu.*`
+  - [x] `lib/zdu.zig` stays testable and doesn't depend on TUI code
 
 ## Phase 3: Complete the CLI
 
