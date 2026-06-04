@@ -431,11 +431,13 @@ pub const Model = struct {
 
     fn appendParentEntry(model: *Model, entries_list: *std.ArrayList(Entry)) !void {
         if (model.parent) |parent| {
+            const parent_stats = parent.knownDirStats() orelse
+                Cache.readCachedDirStats(parent.cwd, model.allocator) orelse Cache.DirStats{};
             try entries_list.append(model.allocator, try allocEntryOwned(
                 model.allocator,
                 "..",
                 parent.cwd,
-                Cache.readCachedDirStats(parent.cwd, model.allocator) orelse .{},
+                parent_stats,
                 true,
                 .parent,
             ));
