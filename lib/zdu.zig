@@ -617,16 +617,23 @@ fn scanParallel(
         return;
     }
 
-    const ThreadResult = struct {
-        totals: ScanTotals = .{},
+    const ThreadCtx = struct {
+        io: std.Io,
+        allocator: mem.Allocator,
+        opts: Options,
+        dir: std.Io.Dir,
+        subdirs: []const SubDir,
+        start: usize,
+        end: usize,
+        check_gen: bool,
+        result: ScanTotals,
     };
 
     const per_thread = subdirs.items.len / actual_workers;
     const remainder = subdirs.items.len % actual_workers;
 
-    var thread_results = try allocator.alloc(ThreadResult, actual_workers);
-    defer allocator.free(thread_results);
-    for (thread_results) |*tr| tr.* = .{};
+    var contexts = try allocator.alloc(ThreadCtx, actual_workers);
+    defer allocator.free(contexts);
 
     var threads = try allocator.alloc(std.Thread, actual_workers);
     defer allocator.free(threads);
@@ -636,43 +643,45 @@ fn scanParallel(
         const count = per_thread + if (i < remainder) @as(usize, 1) else 0;
         const end_idx = start_idx + count;
 
+        contexts[i] = .{
+            .io = io,
+            .allocator = allocator,
+            .opts = opts,
+            .dir = dir,
+            .subdirs = subdirs.items,
+            .start = start_idx,
+            .end = end_idx,
+            .check_gen = check_generated_paths,
+            .result = .{},
+        };
+
         threads[i] = try std.Thread.spawn(.{}, struct {
-            fn run(
-                thread_io: std.Io,
-                thread_alloc: mem.Allocator,
-                thread_opts: Options,
-                thread_dir: std.Io.Dir,
-                all_subdirs: []const SubDir,
-                start: usize,
-                end: usize,
-                check_gen: bool,
-                result: *ThreadResult,
-            ) void {
-                for (all_subdirs[start..end]) |sd| {
-                    var subdir = thread_dir.openDir(thread_io, sd.name, .{
+            fn run(ctx: *ThreadCtx) void {
+                for (ctx.subdirs[ctx.start..ctx.end]) |sd| {
+                    var subdir = ctx.dir.openDir(ctx.io, sd.name, .{
                         .iterate = true,
                         .follow_symlinks = false,
                     }) catch continue;
-                    defer subdir.close(thread_io);
+                    defer subdir.close(ctx.io);
                     var subiter = subdir.iterate();
-                    walkDirTotals(thread_alloc, thread_io, thread_opts, sd.full_path, check_gen, subdir, &subiter, 1, &result.totals) catch {
-                        result.totals.error_count += 1;
+                    walkDirTotals(ctx.allocator, ctx.io, ctx.opts, sd.full_path, ctx.check_gen, subdir, &subiter, 1, &ctx.result) catch {
+                        ctx.result.error_count += 1;
                     };
                 }
             }
-        }.run, .{ io, allocator, opts, dir, subdirs.items, start_idx, end_idx, check_generated_paths, &thread_results[i] });
+        }.run, .{&contexts[i]});
 
         start_idx = end_idx;
     }
 
     for (threads) |thread| thread.join();
 
-    for (thread_results) |tr| {
-        totals.total_size += tr.totals.total_size;
-        totals.total_files += tr.totals.total_files;
-        totals.total_dirs += tr.totals.total_dirs;
-        totals.error_count += tr.totals.error_count;
-        totals.entry_count += tr.totals.entry_count;
+    for (contexts) |ctx| {
+        totals.total_size += ctx.result.total_size;
+        totals.total_files += ctx.result.total_files;
+        totals.total_dirs += ctx.result.total_dirs;
+        totals.error_count += ctx.result.error_count;
+        totals.entry_count += ctx.result.entry_count;
     }
 }
 
