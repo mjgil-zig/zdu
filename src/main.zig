@@ -7,133 +7,6 @@ const Cache = @import("Cache.zig");
 const Scan = @import("Scan.zig");
 const mem = std.mem;
 
-const have_posix_stat = builtin.link_libc and (builtin.os.tag == .linux or builtin.os.tag == .macos);
-const PosixStat = if (have_posix_stat) std.c.Stat else struct {
-    size: i64 = 0,
-    mode: u32 = 0,
-    blocks: i64 = 0,
-};
-
-const c_stat = if (have_posix_stat) struct {
-    extern "c" fn fstatat(dirfd: std.c.fd_t, path: [*:0]const u8, buf: *std.c.Stat, flag: u32) c_int;
-} else struct {};
-
-const c_time = if (builtin.os.tag == .macos) struct {
-    extern "c" fn time(timer: ?*i64) i64;
-} else struct {};
-
-const darwin_xattr = if (builtin.os.tag == .macos) struct {
-    extern "c" fn getxattr(
-        path: [*:0]const u8,
-        name: [*:0]const u8,
-        value: ?*anyopaque,
-        size: usize,
-        position: u32,
-        options: i32,
-    ) isize;
-    extern "c" fn setxattr(
-        path: [*:0]const u8,
-        name: [*:0]const u8,
-        value: ?*const anyopaque,
-        size: usize,
-        position: u32,
-        options: i32,
-    ) c_int;
-    extern "c" fn removexattr(
-        path: [*:0]const u8,
-        name: [*:0]const u8,
-        options: c_int,
-    ) c_int;
-    extern "c" fn fgetxattr(
-        fd: std.c.fd_t,
-        name: [*:0]const u8,
-        value: ?*anyopaque,
-        size: usize,
-        position: u32,
-        options: c_int,
-    ) isize;
-    extern "c" fn fsetxattr(
-        fd: std.c.fd_t,
-        name: [*:0]const u8,
-        value: ?*const anyopaque,
-        size: usize,
-        position: u32,
-        options: c_int,
-    ) c_int;
-} else struct {};
-
-const windows_ads = if (builtin.os.tag == .windows) struct {
-    const HANDLE = std.os.windows.HANDLE;
-    const DWORD = u32;
-
-    const GENERIC_READ: DWORD = 0x80000000;
-    const GENERIC_WRITE: DWORD = 0x40000000;
-    const FILE_SHARE_READ: DWORD = 0x00000001;
-    const FILE_SHARE_WRITE: DWORD = 0x00000002;
-    const FILE_SHARE_DELETE: DWORD = 0x00000004;
-    const CREATE_ALWAYS: DWORD = 2;
-    const OPEN_EXISTING: DWORD = 3;
-    const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
-    const FILE_NAME_NORMALIZED: DWORD = 0x00000000;
-    const VOLUME_NAME_DOS: DWORD = 0x00000000;
-
-    const share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-
-    extern "kernel32" fn CloseHandle(hObject: HANDLE) c_int;
-    extern "kernel32" fn CreateFileW(
-        lpFileName: [*:0]const u16,
-        dwDesiredAccess: DWORD,
-        dwShareMode: DWORD,
-        lpSecurityAttributes: ?*anyopaque,
-        dwCreationDisposition: DWORD,
-        dwFlagsAndAttributes: DWORD,
-        hTemplateFile: ?HANDLE,
-    ) HANDLE;
-    extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) c_int;
-    extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) c_int;
-    extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) void;
-    extern "kernel32" fn GetFinalPathNameByHandleW(
-        hFile: HANDLE,
-        lpszFilePath: [*]u16,
-        cchFilePath: DWORD,
-        dwFlags: DWORD,
-    ) DWORD;
-    extern "kernel32" fn ReadFile(
-        hFile: HANDLE,
-        lpBuffer: [*]u8,
-        nNumberOfBytesToRead: DWORD,
-        lpNumberOfBytesRead: *DWORD,
-        lpOverlapped: ?*anyopaque,
-    ) c_int;
-    extern "kernel32" fn WriteFile(
-        hFile: HANDLE,
-        lpBuffer: [*]const u8,
-        nNumberOfBytesToWrite: DWORD,
-        lpNumberOfBytesWritten: *DWORD,
-        lpOverlapped: ?*anyopaque,
-    ) c_int;
-
-    fn isInvalidHandle(handle: HANDLE) bool {
-        return @intFromPtr(handle) == std.math.maxInt(usize);
-    }
-} else struct {};
-
-fn posixStatIsRegular(stat: PosixStat) bool {
-    if (comptime !have_posix_stat) return false;
-    return std.c.S.ISREG(stat.mode);
-}
-
-fn posixStatApparentSize(stat: PosixStat) u64 {
-    return if (stat.size < 0) 0 else @intCast(stat.size);
-}
-
-fn posixStatAllocatedSize(stat: PosixStat) u64 {
-    const apparent_size = posixStatApparentSize(stat);
-    if (!posixStatIsRegular(stat)) return apparent_size;
-    if (stat.blocks <= 0) return apparent_size;
-    return @as(u64, @intCast(stat.blocks)) * 512;
-}
-
 pub const Model = struct {
     io: std.Io,
     allocator: mem.Allocator,
@@ -2659,7 +2532,7 @@ fn zduTestSetRawDirSizeXattr(
             if (std.os.linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
         },
         .macos => {
-            const rc = darwin_xattr.setxattr(
+            const rc = Cache.darwin_xattr.setxattr(
                 path_z.ptr,
                 Cache.dir_size_xattr_name,
                 bytes.ptr,
@@ -2697,7 +2570,7 @@ fn zduTestSetRawDirStatsXattr(
             if (std.os.linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
         },
         .macos => {
-            const rc = darwin_xattr.setxattr(
+            const rc = Cache.darwin_xattr.setxattr(
                 path_z.ptr,
                 Cache.dir_stats_xattr_name,
                 bytes.ptr,

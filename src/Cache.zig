@@ -6,8 +6,8 @@ const c_time = if (builtin.os.tag == .macos) struct {
     extern "c" fn time(timer: ?*i64) i64;
 } else struct {};
 
-const darwin_xattr = if (builtin.os.tag == .macos) struct {
-    extern "c" fn getxattr(
+pub const darwin_xattr = if (builtin.os.tag == .macos) struct {
+    pub extern "c" fn getxattr(
         path: [*:0]const u8,
         name: [*:0]const u8,
         value: ?*anyopaque,
@@ -15,7 +15,7 @@ const darwin_xattr = if (builtin.os.tag == .macos) struct {
         position: u32,
         options: i32,
     ) isize;
-    extern "c" fn setxattr(
+    pub extern "c" fn setxattr(
         path: [*:0]const u8,
         name: [*:0]const u8,
         value: ?*const anyopaque,
@@ -23,12 +23,12 @@ const darwin_xattr = if (builtin.os.tag == .macos) struct {
         position: u32,
         options: i32,
     ) c_int;
-    extern "c" fn removexattr(
+    pub extern "c" fn removexattr(
         path: [*:0]const u8,
         name: [*:0]const u8,
         options: c_int,
     ) c_int;
-    extern "c" fn fgetxattr(
+    pub extern "c" fn fgetxattr(
         fd: std.c.fd_t,
         name: [*:0]const u8,
         value: ?*anyopaque,
@@ -36,7 +36,7 @@ const darwin_xattr = if (builtin.os.tag == .macos) struct {
         position: u32,
         options: c_int,
     ) isize;
-    extern "c" fn fsetxattr(
+    pub extern "c" fn fsetxattr(
         fd: std.c.fd_t,
         name: [*:0]const u8,
         value: ?*const anyopaque,
