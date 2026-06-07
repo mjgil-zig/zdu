@@ -2,7 +2,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const mem = std.mem;
 const vaxis = @import("vaxis");
-const vxfw = vaxis.vxfw;const zdu = @import("zdu");
+const vxfw = vaxis.vxfw;
+const zdu = @import("zdu");
 const Cache = @import("Cache.zig");
 const Scan = @import("Scan.zig");
 const Model = @import("Model.zig").Model;
@@ -10,7 +11,6 @@ const Cli = @import("Cli.zig");
 
 const parseArgs = Cli.parseArgs;
 const main = Cli.main;
-
 
 fn testEventContext(allocator: mem.Allocator, io: std.Io) vxfw.EventContext {
     return .{
@@ -43,7 +43,6 @@ fn finishLoading(model: *Model, allocator: mem.Allocator, io: std.Io) !void {
         try model.handleEvent(&ctx, .tick);
     }
 }
-
 
 test "navigateInto adds parent entry and navigateUp restores cwd" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -712,8 +711,6 @@ test "computeDirSize counts allocated bytes for sparse files" {
     try std.testing.expect(size < stat.size);
 }
 
-
-
 test "parseArgs: --help" {
     const args = &[_][]const u8{ "zdu", "--help" };
     const config = try parseArgs(args);
@@ -896,7 +893,6 @@ fn zduTestEncodeCacheRecord(buf: *[16]u8, size: u64, expires_at: u64) void {
     std.mem.writeInt(u64, buf[8..16], expires_at, .little);
 }
 
-
 fn zduTestEncodeStatsCacheRecord(buf: *[32]u8, stats: Model.DirStats, expires_at: u64) void {
     std.mem.writeInt(u64, buf[0..8], stats.size, .little);
     std.mem.writeInt(u64, buf[8..16], stats.file_count, .little);
@@ -979,7 +975,6 @@ fn zduTestSetRawDirStatsXattr(
         else => return error.SkipZigTest,
     }
 }
-
 
 test "loading writes each nested directory cache with that directory's own size" {
     switch (builtin.os.tag) {

@@ -658,5 +658,4 @@ pub const Model = struct {
     pub fn draw(model: *Model, ctx: vxfw.DrawContext) mem.Allocator.Error!vxfw.Surface {
         return @import("ModelDraw.zig").draw(model, ctx);
     }
-
 };
