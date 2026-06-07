@@ -1,5 +1,8 @@
 # zdu
 
+[![CI](https://github.com/mjgil-zig/zdu/actions/workflows/ci.yaml/badge.svg)](https://github.com/mjgil-zig/zdu/actions/workflows/ci.yaml)
+[![Coverage](https://img.shields.io/badge/coverage-82.5%25-brightgreen)](ARCHITECTURE.md#testing)
+
 A fast, low-memory disk usage analyzer with an interactive TUI and a scriptable CLI.
 
 ## Installation

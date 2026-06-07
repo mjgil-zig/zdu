@@ -63,4 +63,15 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the zdu executable");
     run_step.dependOn(&run_cmd.step);
+
+    // Coverage step: run tests under kcov
+    const cover_step = b.step("cover", "Generate test coverage report with kcov");
+    const run_cover = b.addSystemCommand(&.{
+        "kcov",
+        "--clean",
+        "--include-pattern=src/,lib/",
+    });
+    run_cover.addArg(b.pathJoin(&.{ b.install_path, "cover" }));
+    run_cover.addArtifactArg(app_tests);
+    cover_step.dependOn(&run_cover.step);
 }
