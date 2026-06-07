@@ -137,7 +137,7 @@
 - [x] **7.2 Add CHANGELOG.md**
   - [x] Track versions and features
 
-- [ ] **7.3 Add man page or generate from `--help`**
+- [ ] **7.3 Add man page or generate from `--help`** (optional, deferred)
   - [ ] Optional: use a tool like `help2man` in CI
 
 ## Priority Summary

@@ -49,12 +49,24 @@ zdu/
 ├── build.zig              # Zig build configuration
 ├── build.zig.zon          # Dependency manifest (vaxis 0.6.0)
 ├── src/
-│   └── main.zig           # CLI + TUI Model (~4,200 lines)
+│   ├── main.zig           # Root entry point (10 lines)
+│   ├── Cli.zig            # CLI parsing, --no-tui, benchmarks (285 lines)
+│   ├── Model.zig          # TUI state machine core (662 lines)
+│   ├── ModelLoad.zig      # Directory loading & parallel scanning (410 lines)
+│   ├── ModelEvent.zig     # Keyboard/mouse event handling (214 lines)
+│   ├── ModelNav.zig       # Navigation & delete confirmation (88 lines)
+│   ├── ModelDraw.zig      # TUI rendering & formatting (112 lines)
+│   ├── Scan.zig           # Serial & parallel scanning strategies (701 lines)
+│   ├── Cache.zig          # xattr/ADS cache read/write (672 lines)
+│   └── main_test.zig      # Unit & integration tests (1,565 lines)
 ├── lib/
-│   └── zdu.zig            # Public library API (~540 lines)
+│   ├── zdu.zig            # Public library API re-exports (554 lines)
+│   ├── stat.zig           # POSIX stat helpers (75 lines)
+│   ├── walk.zig           # Directory walking (199 lines)
+│   └── format.zig         # Output formatting (89 lines)
 ├── docs/
 │   ├── design.md          # This document
-│   └── todo.md            # Task list to finish
+│   └── todo.md            # Task list
 ├── .github/workflows/
 │   ├── ci.yaml            # Multi-platform CI
 │   └── release.yaml       # Release builds + GitHub publish
@@ -67,7 +79,7 @@ zdu/
 
 ### 1. Model (TUI State Machine)
 
-**File**: `src/main.zig` lines 130–2512
+**File**: `src/Model.zig` (~660 lines) with helpers in `src/ModelLoad.zig`, `src/ModelEvent.zig`, `src/ModelNav.zig`, `src/ModelDraw.zig`
 
 The `Model` struct is the heart of the application. It implements the `vxfw.Widget` interface and manages:
 
@@ -103,17 +115,17 @@ pub const Model = struct {
 ### 2. Scanning Strategies
 
 #### Serial Stack Scan
-**Functions**: `computeDirStatsStack`, `computeDirStatsStackWithCache`
+**Functions**: `Scan.computeDirStatsStack`, `Scan.computeDirStatsStackWithCache`
 
 Iterative DFS using an explicit `ArrayList(StackFrame)` to avoid stack overflow on deep trees. Reads cache at each directory entry; writes cache bottom-up on completion.
 
 #### Recursive Scan (with cache fallback)
-**Functions**: `computeDirStats`, `computeDirStatsInDir`
+**Functions**: `Scan.computeDirStats`, `Scan.computeDirStatsInDir`
 
 Simpler recursive version used by `runNoTui` fallback and some eager-load paths.
 
 #### Dynamic Parallel Scan
-**Functions**: `computeDirStatsDynamicOwned`, `computeDynamicScanInputs`
+**Functions**: `Scan.computeDirStatsDynamicOwned`, `Scan.computeDynamicScanInputs`
 
 Work-stealing scheduler:
 1. Starts with top-level child directories as tasks
@@ -124,7 +136,7 @@ Work-stealing scheduler:
 This ensures cache writes remain bottom-up even with dynamic splitting.
 
 #### Entry Parallel Scan
-**Functions**: `scanEntryTasks`, `loadDirParallel`
+**Functions**: `ModelLoad.scanEntryTasks`, `ModelLoad.loadDirParallel`
 
 Used during TUI directory loading when `--parallel` is enabled. Each immediate child directory becomes a task; tasks are sorted by estimated file count (from cache) so larger subtrees are processed first.
 
@@ -172,9 +184,8 @@ pub const Options = struct {
     show_hidden: bool,
     max_depth: ?usize,
     max_entries: ?usize,
-    parallel: bool,       // currently ignored by library
-    num_threads: usize,   // currently ignored by library
-    use_io_uring: bool,   // currently dead code
+    parallel: bool,
+    num_threads: usize
 };
 
 pub const ScanResult = struct {
@@ -191,11 +202,11 @@ pub fn scanAndFormat(io: std.Io, opts: Options, writer: anytype) !void;
 
 **Current behavior**: `scanAndFormat` performs a streaming walk, emitting entries to `writer` in either human or JSON format. `scan` aggregates totals without retaining per-entry data.
 
-**Problem**: The CLI barely uses this library. Most real work is done by `Model`'s internal scanning functions.
+**Note**: The CLI uses `Scan.zig` for cached/parallel scanning paths and falls back to `lib/zdu.zig` for simple streaming scans. Library duplication has been resolved: stat helpers live in `lib/stat.zig` and are imported by both `lib/zdu.zig` and `src/Scan.zig`.
 
 ### 5. CLI Argument Parsing
 
-**File**: `src/main.zig` lines 3431–3484
+**File**: `src/Cli.zig` (~70 lines of `Config` + `parseArgs`)
 
 ```zig
 const Config = struct {
@@ -216,19 +227,23 @@ Supported flags:
 - `zdu --refresh-cache --cache-ttl N [path]`
 - `zdu --parallel --jobs N ... [path]`
 - `zdu --bench [path]` (undocumented)
-
-Missing flags: `--help`, `--version`, `--format`, `--max-depth`, `--show-hidden`, `--summarize`
+- `zdu --help` / `-h`
+- `zdu --version` / `-v`
+- `zdu --format human|json`
+- `zdu --max-depth N`
+- `zdu --show-hidden`
+- `zdu --summarize` (default in no-TUI mode)
 
 ## Data Flow
 
 ### TUI Mode Startup
 
 ```
-main() → parseArgs() → Model.initLoadingWithOptions()
-    → beginLoading() → load entries with empty DirStats
+Cli.main() → Cli.parseArgs() → Model.initLoadingWithOptions()
+    → Model.beginLoading() → load entries with empty DirStats
     → vxfw.App.run() → handleEvent(.init)
         → ctx.tick() → handleEvent(.tick)
-            → advanceLoading() → advanceLoadingStep()
+            → Model.advanceLoading() → Model.advanceLoadingStep()
                 → scan each directory entry incrementally
                 → update entry.size/file_count/dir_count in place
                 → write cache bottom-up
@@ -238,7 +253,7 @@ main() → parseArgs() → Model.initLoadingWithOptions()
 ### No-TUI Mode
 
 ```
-main() → parseArgs() → runNoTui()
+Cli.main() → Cli.parseArgs() → Cli.runNoTui()
     → if cache/parallel enabled: scanRootStats()
         → enumerate children, create ParallelScanTasks
         → if parallel & worker_count > 1: computeDynamicScanInputs()
@@ -290,19 +305,22 @@ user confirms (Y or Enter) → confirmDelete()
 
 ## Known Issues & Technical Debt
 
-1. **`std.time.timestamp()` removed in Zig 0.16.0** — compilation fails
-2. **Library/CLI duplication** — `fileSizeOnDiskAt`, `cStatAt`, `posixStat*` exist in both `lib/zdu.zig` and `src/main.zig`
-3. **`use_io_uring` dead code** — declared but never referenced
-4. **`page_allocator` hardcoded** — `lib/zdu.zig` uses it instead of accepting an allocator
-5. **Missing CLI flags** — library supports JSON, max-depth, show-hidden; CLI does not expose them
-6. **No `--help` or `--version`** — users must read README
-7. **Surprising file delete UX** — Enter on a file triggers immediate deletion without confirmation
-8. **Mouse right-click deletes directories** — no confirmation dialog
-9. **Model is 4,200 lines** — violates single-responsibility principle
+All previously listed technical debt has been resolved:
+
+1. ✅ **`std.time.timestamp()` removed** — fixed: uses platform-specific `clock_gettime`/`GetSystemTimeAsFileTime`
+2. ✅ **Library/CLI duplication** — fixed: stat helpers extracted to `lib/stat.zig`, shared by `lib/zdu.zig` and `src/Scan.zig`
+3. ✅ **`use_io_uring` dead code** — removed from `Options` and all references
+4. ✅ **`page_allocator` hardcoded** — fixed: `lib/zdu.zig` accepts `allocator` parameter
+5. ✅ **Missing CLI flags** — all implemented: `--help`, `--version`, `--format`, `--max-depth`, `--show-hidden`, `--summarize`
+6. ✅ **No `--help` or `--version`** — implemented
+7. ✅ **Surprising file delete UX** — fixed: all deletes go through `[Y/n]` confirmation dialog
+8. ✅ **Mouse right-click deletes directories** — fixed: opens confirmation dialog
+9. ✅ **Model is 4,200 lines** — fixed: split into `Model.zig` (662) + `ModelLoad.zig` (410) + `ModelEvent.zig` (214) + `ModelNav.zig` (88) + `ModelDraw.zig` (112)
 
 ## Testing Strategy
 
-- **Unit tests**: 60+ tests embedded in `src/main.zig` covering navigation, cache round-trips, delete propagation, parallel correctness
+- **Unit tests**: 60+ tests in `src/main_test.zig` covering navigation, cache round-trips, delete propagation, parallel correctness, CLI argument parsing
 - **Platform-specific tests**: Skip on unsupported OSs using `error.SkipZigTest`
 - **CI**: Multi-platform builds + smoke tests + xattr/ADS validation
-- **Gaps**: No binary-level integration tests, no library API coverage for `scanAndFormat`, no CLI `--help` tests
+- **Integration tests**: `zdu --help`, `zdu --version`, `zdu --no-tui --summarize` tested via binary execution
+- **Library API tests**: `scanAndFormat` JSON output, `scan` with `--max-depth` and `--show-hidden`
