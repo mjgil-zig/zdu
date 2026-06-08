@@ -1558,3 +1558,449 @@ test "right-click on directory opens delete confirmation" {
     // Clean up allocated confirm_delete path
     model.cancelDelete();
 }
+
+// ============================================
+// Synthetic File System Helpers
+// ============================================
+
+const SyntheticConfig = struct {
+    l1_count: usize,
+    l2_count: usize,
+    files_per_l2: usize,
+    file_size: usize,
+};
+
+fn syntheticFsCreate(tmp: *std.testing.TmpDir, config: SyntheticConfig) !void {
+    const content = try std.testing.allocator.alloc(u8, config.file_size);
+    defer std.testing.allocator.free(content);
+    @memset(content, 'x');
+
+    var l1_buf: [16]u8 = undefined;
+    var l2_buf: [32]u8 = undefined;
+    var file_buf: [48]u8 = undefined;
+
+    for (0..config.l1_count) |l1| {
+        const l1_name = std.fmt.bufPrint(&l1_buf, "d{d:0>2}", .{l1}) catch continue;
+        try tmp.dir.createDirPath(std.testing.io, l1_name);
+
+        for (0..config.l2_count) |l2| {
+            const l2_path = std.fmt.bufPrint(&l2_buf, "{s}/s{d:0>2}", .{ l1_name, l2 }) catch continue;
+            try tmp.dir.createDirPath(std.testing.io, l2_path);
+
+            for (0..config.files_per_l2) |f| {
+                const file_path = std.fmt.bufPrint(&file_buf, "{s}/f{d:0>4}", .{ l2_path, f }) catch continue;
+                var file = try tmp.dir.createFile(std.testing.io, file_path, .{});
+                defer file.close(std.testing.io);
+                try file.writeStreamingAll(std.testing.io, content);
+            }
+        }
+    }
+}
+
+fn syntheticFsRootPath(tmp: *std.testing.TmpDir, allocator: mem.Allocator) ![]u8 {
+    return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+}
+
+fn zduTestReadSurfaceRow(allocator: mem.Allocator, surface: vxfw.Surface, row: u16) ![]u8 {
+    if (row >= surface.size.height) return allocator.dupe(u8, "");
+    var chars: std.ArrayList(u8) = .empty;
+    defer chars.deinit(allocator);
+    for (0..surface.size.width) |col| {
+        const cell = surface.readCell(@intCast(col), row);
+        try chars.appendSlice(allocator, cell.char.grapheme);
+    }
+    // Trim trailing spaces
+    var end = chars.items.len;
+    while (end > 0 and chars.items[end - 1] == ' ') end -= 1;
+    return allocator.dupe(u8, chars.items[0..end]);
+}
+
+// ============================================
+// Synthetic File System Tests
+// ============================================
+
+test "synthetic 100K file system scan consistency" {
+    if (!std.testing.environ.containsConstant("GITHUB_ACTIONS")) {
+        return error.SkipZigTest;
+    }
+
+    switch (builtin.os.tag) {
+        .linux, .macos, .windows => {},
+        else => return error.SkipZigTest,
+    }
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create: 10 l1 dirs * 10 l2 dirs * 1000 files = 100,000 files
+    const config = SyntheticConfig{
+        .l1_count = 10,
+        .l2_count = 10,
+        .files_per_l2 = 1000,
+        .file_size = 1024,
+    };
+    try syntheticFsCreate(&tmp, config);
+
+    const root_path = try syntheticFsRootPath(&tmp, allocator);
+    defer allocator.free(root_path);
+
+    // Ground truth: serial stack scan with no cache
+    const ground_truth = try Scan.computeDirStatsStackRefreshing(root_path, allocator, io, 0);
+
+    const expected_files = config.l1_count * config.l2_count * config.files_per_l2;
+    const expected_dirs = 1 + config.l1_count + (config.l1_count * config.l2_count);
+
+    try std.testing.expectEqual(expected_files, ground_truth.file_count);
+    try std.testing.expectEqual(expected_dirs, ground_truth.dir_count);
+    try std.testing.expect(ground_truth.size > 0);
+
+    // Parallel scan should match ground truth
+    const parallel = try Scan.scanRootStats(io, allocator, root_path, .{
+        .cache_ttl_seconds = 0,
+        .refresh_cache = true,
+        .parallel = true,
+        .num_threads = 4,
+    });
+
+    try std.testing.expectEqual(ground_truth.size, parallel.size);
+    try std.testing.expectEqual(ground_truth.file_count, parallel.file_count);
+    try std.testing.expectEqual(ground_truth.dir_count, parallel.dir_count);
+
+    // TUI model (parallel path) should match ground truth
+    const model = try Model.initLoadingWithOptions(io, allocator, root_path, .{
+        .cache_ttl_seconds = 0,
+        .refresh_cache = true,
+        .parallel = true,
+        .num_threads = 4,
+    });
+    defer model.deinit();
+
+    try finishLoading(model, allocator, io);
+
+    const summary = model.entries[0];
+    try std.testing.expectEqual(Model.EntryRole.summary, summary.role);
+    try std.testing.expectEqual(ground_truth.size, summary.size);
+    try std.testing.expectEqual(ground_truth.file_count, summary.file_count);
+    try std.testing.expectEqual(ground_truth.dir_count, summary.dir_count);
+
+    // Verify root has expected number of item entries (the l1 dirs)
+    var root_item_count: usize = 0;
+    for (model.entries) |entry| {
+        if (entry.role == .item) root_item_count += 1;
+    }
+    try std.testing.expectEqual(config.l1_count, root_item_count);
+
+    // Navigate into first l1 dir
+    const first_l1_idx = findEntryIndex(model, "d00") orelse return error.SkipZigTest;
+    model.selected = first_l1_idx;
+    try model.navigateInto();
+    try finishLoading(model, allocator, io);
+
+    try std.testing.expect(std.mem.indexOf(u8, model.cwd, "d00") != null);
+    try std.testing.expect(model.parent != null);
+
+    // d00 should have l2_count dirs as items
+    var d00_item_count: usize = 0;
+    for (model.entries) |entry| {
+        if (entry.role == .item) d00_item_count += 1;
+    }
+    try std.testing.expectEqual(config.l2_count, d00_item_count);
+
+    // In child directories, entries[0] is the parent ".." entry (no summary)
+    const d00_parent = model.entries[0];
+    try std.testing.expectEqual(Model.EntryRole.parent, d00_parent.role);
+    try std.testing.expectEqualStrings("..", d00_parent.name);
+
+    // The ".." entry should show the parent (root) total size
+    const root_summary = model.parent.?.entries[0];
+    try std.testing.expectEqual(root_summary.size, d00_parent.size);
+    try std.testing.expectEqual(root_summary.file_count, d00_parent.file_count);
+    try std.testing.expectEqual(root_summary.dir_count, d00_parent.dir_count);
+
+    // Verify the d00 entry in the root had the correct stats
+    const d00_in_root = model.parent.?.entries[findEntryIndex(model.parent.?, "d00") orelse return error.SkipZigTest];
+    try std.testing.expectEqual(@as(u64, config.l2_count * config.files_per_l2), d00_in_root.file_count);
+    try std.testing.expectEqual(@as(u64, config.l2_count + 1), d00_in_root.dir_count);
+
+    // Navigate into first l2 dir
+    const first_l2_idx = findEntryIndex(model, "s00") orelse return error.SkipZigTest;
+    model.selected = first_l2_idx;
+    try model.navigateInto();
+    try finishLoading(model, allocator, io);
+
+    // s00 should have files_per_l2 files
+    var s00_file_count: usize = 0;
+    for (model.entries) |entry| {
+        if (entry.role == .item and !entry.is_dir) s00_file_count += 1;
+    }
+    try std.testing.expectEqual(config.files_per_l2, s00_file_count);
+
+    // Spot-check: every file in s00 should have the same size
+    const expected_file_size = if (model.entries.len > 1) model.entries[1].size else 0;
+    for (model.entries) |entry| {
+        if (entry.role == .item and !entry.is_dir) {
+            try std.testing.expectEqual(expected_file_size, entry.size);
+        }
+    }
+
+    // Navigate up to d00
+    try model.navigateUp();
+    try std.testing.expect(std.mem.indexOf(u8, model.cwd, "d00") != null);
+
+    // Navigate up to root
+    try model.navigateUp();
+    try std.testing.expectEqualStrings(root_path, model.cwd);
+    try std.testing.expect(model.parent == null);
+
+    // Root summary should still match ground truth after navigation
+    try std.testing.expectEqual(ground_truth.size, model.entries[0].size);
+    try std.testing.expectEqual(ground_truth.file_count, model.entries[0].file_count);
+}
+
+test "synthetic file system draw displays correct sizes" {
+    if (!std.testing.environ.containsConstant("GITHUB_ACTIONS")) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Small tree for draw testing: 2 * 2 * 3 = 12 files
+    const config = SyntheticConfig{
+        .l1_count = 2,
+        .l2_count = 2,
+        .files_per_l2 = 3,
+        .file_size = 1024,
+    };
+    try syntheticFsCreate(&tmp, config);
+
+    const root_path = try syntheticFsRootPath(&tmp, allocator);
+    defer allocator.free(root_path);
+
+    const model = try Model.initLoadingWithOptions(io, allocator, root_path, .{
+        .cache_ttl_seconds = 0,
+        .refresh_cache = true,
+    });
+    defer model.deinit();
+    try finishLoading(model, allocator, io);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const draw_ctx = vxfw.DrawContext{
+        .arena = arena.allocator(),
+        .min = .{ .width = 80, .height = 24 },
+        .max = .{ .width = 80, .height = 24 },
+        .cell_size = .{ .width = 8, .height = 16 },
+    };
+
+    const surface = try model.draw(draw_ctx);
+
+    // Read row 2 (first entry line after title)
+    const row2_text = try zduTestReadSurfaceRow(allocator, surface, 2);
+    defer allocator.free(row2_text);
+
+    // Should contain the root summary with [ROOT] and size
+    try std.testing.expect(std.mem.indexOf(u8, row2_text, "[ROOT]") != null);
+
+    var size_buf: [32]u8 = undefined;
+    const root_size_str = Model.formatSize(&size_buf, model.entries[0].size);
+    try std.testing.expect(std.mem.indexOf(u8, row2_text, root_size_str) != null);
+
+    // Should show file count
+    var file_count_buf: [32]u8 = undefined;
+    const file_count_str = try std.fmt.bufPrint(&file_count_buf, "{d}", .{model.entries[0].file_count});
+    try std.testing.expect(std.mem.indexOf(u8, row2_text, file_count_str) != null);
+
+    // Navigate into d00 and redraw
+    model.selected = findEntryIndex(model, "d00") orelse return error.SkipZigTest;
+    try model.navigateInto();
+    try finishLoading(model, allocator, io);
+
+    {
+        var arena2 = std.heap.ArenaAllocator.init(allocator);
+        defer arena2.deinit();
+
+        const draw_ctx2 = vxfw.DrawContext{
+            .arena = arena2.allocator(),
+            .min = .{ .width = 80, .height = 24 },
+            .max = .{ .width = 80, .height = 24 },
+            .cell_size = .{ .width = 8, .height = 16 },
+        };
+
+        const surface2 = try model.draw(draw_ctx2);
+
+        const d00_row2 = try zduTestReadSurfaceRow(allocator, surface2, 2);
+        defer allocator.free(d00_row2);
+
+        // Should show parent ".." entry with [DIR]
+        try std.testing.expect(std.mem.indexOf(u8, d00_row2, "..") != null);
+        try std.testing.expect(std.mem.indexOf(u8, d00_row2, "[DIR]") != null);
+
+        var d00_size_buf: [32]u8 = undefined;
+        const d00_size_str = Model.formatSize(&d00_size_buf, model.entries[0].size);
+        try std.testing.expect(std.mem.indexOf(u8, d00_row2, d00_size_str) != null);
+    }
+
+    // Navigate into s00 and redraw
+    model.selected = findEntryIndex(model, "s00") orelse return error.SkipZigTest;
+    try model.navigateInto();
+    try finishLoading(model, allocator, io);
+
+    {
+        var arena3 = std.heap.ArenaAllocator.init(allocator);
+        defer arena3.deinit();
+
+        const draw_ctx3 = vxfw.DrawContext{
+            .arena = arena3.allocator(),
+            .min = .{ .width = 80, .height = 24 },
+            .max = .{ .width = 80, .height = 24 },
+            .cell_size = .{ .width = 8, .height = 16 },
+        };
+
+        const surface3 = try model.draw(draw_ctx3);
+
+        const s00_row2 = try zduTestReadSurfaceRow(allocator, surface3, 2);
+        defer allocator.free(s00_row2);
+
+        // s00 should show [DIR] parent entry
+        try std.testing.expect(std.mem.indexOf(u8, s00_row2, "..") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s00_row2, "[DIR]") != null);
+
+        // Verify one of the file rows shows [FILE] and size
+        const s00_row3 = try zduTestReadSurfaceRow(allocator, surface3, 3);
+        defer allocator.free(s00_row3);
+        try std.testing.expect(std.mem.indexOf(u8, s00_row3, "[FILE]") != null);
+    }
+}
+
+test "synthetic fs delete updates parent sizes recursively" {
+    if (!std.testing.environ.containsConstant("GITHUB_ACTIONS")) {
+        return error.SkipZigTest;
+    }
+
+    switch (builtin.os.tag) {
+        .linux, .macos, .windows => {},
+        else => return error.SkipZigTest,
+    }
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Small tree: 2 l1 dirs * 2 l2 dirs * 3 files = 12 files
+    const config = SyntheticConfig{
+        .l1_count = 2,
+        .l2_count = 2,
+        .files_per_l2 = 3,
+        .file_size = 1024,
+    };
+    try syntheticFsCreate(&tmp, config);
+
+    const root_path = try syntheticFsRootPath(&tmp, allocator);
+    defer allocator.free(root_path);
+
+    const d00_path = try std.fs.path.join(allocator, &.{ root_path, "d00" });
+    defer allocator.free(d00_path);
+
+    // Load with cache so delete propagation writes cache
+    const model = try Model.initLoadingWithOptions(io, allocator, root_path, .{
+        .cache_ttl_seconds = 3600,
+        .refresh_cache = true,
+    });
+    defer model.deinit();
+    try finishLoading(model, allocator, io);
+
+    // Record initial root stats
+    const initial_root_size = model.entries[0].size;
+    const initial_root_files = model.entries[0].file_count;
+
+    // Navigate into d00 -> s00
+    model.selected = findEntryIndex(model, "d00") orelse return error.SkipZigTest;
+    try model.navigateInto();
+    try finishLoading(model, allocator, io);
+
+    model.selected = findEntryIndex(model, "s00") orelse return error.SkipZigTest;
+    try model.navigateInto();
+    try finishLoading(model, allocator, io);
+
+    // Find a file and record its size
+    const file_idx = findEntryIndex(model, "f000") orelse return error.SkipZigTest;
+    const file_size = model.entries[file_idx].size;
+
+    // Delete the file
+    model.selected = file_idx;
+    try model.deleteSelected();
+    try model.confirmDelete();
+
+    // File should be gone from current entries
+    try std.testing.expect(findEntryIndex(model, "f000") == null);
+
+    // The ".." entry should show updated parent (d00) stats
+    const d00_parent_after_file_delete = model.entries[0];
+    try std.testing.expectEqual(Model.EntryRole.parent, d00_parent_after_file_delete.role);
+
+    // Navigate up to d00
+    try model.navigateUp();
+    try finishLoading(model, allocator, io);
+
+    // Navigate up to root
+    try model.navigateUp();
+    try finishLoading(model, allocator, io);
+
+    // Root should have one less file and reduced size
+    try std.testing.expectEqual(initial_root_files - 1, model.entries[0].file_count);
+    try std.testing.expectEqual(initial_root_size - file_size, model.entries[0].size);
+
+    // Verify cache was updated for root
+    const root_cached = try zduTestRequireCachedStats(root_path, allocator);
+    try std.testing.expectEqual(model.entries[0].size, root_cached.size);
+    try std.testing.expectEqual(model.entries[0].file_count, root_cached.file_count);
+
+    // Verify cache was updated for d00
+    const d00_cached = try zduTestRequireCachedStats(d00_path, allocator);
+    try std.testing.expectEqual(model.entries[findEntryIndex(model, "d00") orelse return error.SkipZigTest].size, d00_cached.size);
+    try std.testing.expectEqual(@as(u64, 5), d00_cached.file_count); // 2 l2 dirs * 3 files - 1 deleted = 5
+
+    // Now delete a directory (s01 from d00)
+    model.selected = findEntryIndex(model, "d00") orelse return error.SkipZigTest;
+    try model.navigateInto();
+    try finishLoading(model, allocator, io);
+
+    const s01_idx = findEntryIndex(model, "s01") orelse return error.SkipZigTest;
+    const s01_size = model.entries[s01_idx].size;
+    const s01_files = model.entries[s01_idx].file_count;
+
+    model.selected = s01_idx;
+    try model.deleteSelected();
+    try model.confirmDelete();
+
+    // s01 should be gone from d00 entries
+    try std.testing.expect(findEntryIndex(model, "s01") == null);
+
+    // Navigate up to root
+    try model.navigateUp();
+    try finishLoading(model, allocator, io);
+
+    // Root should reflect both deletions
+    try std.testing.expectEqual(initial_root_files - 1 - s01_files, model.entries[0].file_count);
+    try std.testing.expectEqual(initial_root_size - file_size - s01_size, model.entries[0].size);
+
+    // Verify the d00 entry in root reflects the dir deletion
+    const d00_after_dir_delete = model.entries[findEntryIndex(model, "d00") orelse return error.SkipZigTest];
+    try std.testing.expectEqual(@as(u64, 2), d00_after_dir_delete.file_count); // only s00 remains with 2 files
+    try std.testing.expectEqual(@as(u64, 2), d00_after_dir_delete.dir_count); // s00 + self
+
+    // Verify updated root cache
+    const root_cached_final = try zduTestRequireCachedStats(root_path, allocator);
+    try std.testing.expectEqual(model.entries[0].size, root_cached_final.size);
+    try std.testing.expectEqual(model.entries[0].file_count, root_cached_final.file_count);
+}
